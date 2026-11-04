@@ -293,7 +293,7 @@ const badgeCls = v => 'badge b-' + ({ 'In behandeling': 'Behandeling', 'Wacht op
 
 // ---------- database (Claude) ----------
 let db = null, U = null, me = '';
-const D = { objecten: [], werkorders: [], periodes: [], uren: [], locaties: [], stam: [], facturen: [] };
+const D = { objecten: [], werkorders: [], periodes: [], uren: [], locaties: [], stam: [], facturen: [], projecten: [], arbeid: [], documenten: [], doorbelasting: [] };
 const objById = () => Object.fromEntries(D.objecten.map(o => [o.id, o]));
 const names = {};
 const who = id => !id ? '' : id === me ? 'jij' : (names[id] || 'collega');
@@ -324,7 +324,7 @@ async function start() {
   [db, U] = await Promise.all([claude.use('db'), claude.use('user')]);
   if (!db) return msg('Geen verbinding', 'Kan geen verbinding maken met de database.');
   if (U) { me = (await U.id()) || ''; const v = await U.me(); $('who').textContent = v.name ? 'Ingelogd als ' + v.name : ''; }
-  let first = 7; const ready = () => { if (--first === 0) { updCounts(); render(); } };
+  let first = 11; const ready = () => { if (--first === 0) { updCounts(); render(); } };
   const sub = (name, key, map) => { let got = false;
     col(name).onSnapshot(snap => { D[key] = docs(snap).map(map || (x => x));
       updCounts();
@@ -337,6 +337,10 @@ async function start() {
   sub('locaties', 'locaties', x => Object.assign(x, { id: x._id }));
   sub('stam', 'stam');
   sub('facturen', 'facturen', x => Object.assign(x, { id: x._id }));
+  sub('projecten', 'projecten', x => Object.assign(x, { id: x._id }));
+  sub('arbeid', 'arbeid', x => Object.assign(x, { id: x._id }));
+  sub('documenten', 'documenten', x => Object.assign(x, { id: x._id }));
+  sub('doorbelasting', 'doorbelasting', x => Object.assign(x, { id: x._id }));
 }
 function updCounts() { $('woCount').textContent = D.werkorders.filter(x => OPEN_WO.includes(x.status)).length || ''; $('factCount').textContent = D.facturen.filter(f => f.status === 'Te controleren').length || ''; }
 
@@ -474,6 +478,7 @@ function editObject(o, preset) {
     for (const k in rec) if (rec[k] === null && isNew) delete rec[k];
     try { isNew ? await col('objecten').doc(id).set(rec) : await col('objecten').doc(id).update(rec); } catch (e) { return fail(e, 'object'); }
     const loc = D.objecten.find(x => x.id === id); if (loc) Object.assign(loc, rec); else D.objecten.push(Object.assign({ id }, rec));
+    if (afterObjectSave) { const cb = afterObjectSave; afterObjectSave = null; await cb(id, rec); }
     toast('Opgeslagen'); showObject(id);
   };
   openDlg(isNew ? 'Nieuw object' : 'Wijzigen: ' + objName(o), [form,
@@ -842,7 +847,7 @@ function viewDashboard() {
       tile(open.length ? 'red' : 'grn', 'Open werkorders', open.length, urgent ? `${urgent} hoog/urgent` : 'geen urgente', 'onderhoud', { st: 'open' }),
       tile('grn', 'Afgerond deze maand', closed, 'werkorders', 'onderhoud', { st: 'Afgerond' }),
       tile('blu', cur ? 'Urenstanden ' + cur.naam : 'Urenstanden', cur ? `${done}/${ut.length}` : '–', lower ? `${lower} lager dan vorige stand` : (cur ? `${ut.length ? Math.round(done / ut.length * 100) : 0}% ingevuld` : 'nog geen periode'), 'uren', { per: cur?.id, filt: 'todo' }),
-      (() => { const o = D.facturen.filter(f => f.status !== 'Betaald'); const tc = D.facturen.filter(f => f.status === 'Te controleren').length;
+      (() => { const o = D.facturen.filter(isOpen); const tc = D.facturen.filter(f => f.status === 'Te controleren').length;
         return tile(D.facturen.some(isOverdue) ? 'red' : '', 'Nog te betalen', eur0(o.reduce((s, f) => s + incl(f), 0)), tc ? `${tc} te controleren` : `${o.length} facturen`, 'facturatie', { st: '' }); })(),
       tile('', 'Locaties', locs().length, locs().join(', '), 'locaties')),
     meldPanel(open),
@@ -864,10 +869,11 @@ const STAM = [
   ['merken', 'Merken', 'objecten', 'merk'],
   ['leveranciers', 'Leveranciers', 'objecten', 'leverancier'],
   ['soorten', 'Soorten werkorder', 'werkorders', 'soort'],
-  ['kostensoorten', 'Kostensoorten (facturen)', 'facturen', 'soort']];
+  ['kostensoorten', 'Kostensoorten (facturen)', 'facturen', 'soort'],
+  ['monteurs', 'Monteurs', 'arbeid', 'monteur']];
 async function saveStam(upd) {
   const ref = col('stam').doc('lijsten'); const curDoc = stamL();
-  const data = Object.assign({}, ...STAM.map(([k]) => ({ [k]: curDoc[k] || (k === 'soorten' ? SOORT_WO : k === 'kostensoorten' ? KOSTEN : []) })), upd);
+  const data = Object.assign({}, ...STAM.map(([k]) => ({ [k]: curDoc[k] || (k === 'soorten' ? SOORT_WO : k === 'kostensoorten' ? KOSTEN : k === 'monteurs' ? MONTEURS : []) })), upd);
   try { await ref.set(data); } catch (e) { return fail(e, 'stam'); }
   const i = D.stam.findIndex(x => x._id === 'lijsten'); if (i >= 0) D.stam[i] = Object.assign({ _id: 'lijsten' }, data); else D.stam.push(Object.assign({ _id: 'lijsten' }, data));
   return true;
@@ -877,7 +883,7 @@ function viewStam() {
   const L = stamL();
   $('main').replaceChildren(h('p', { class: 'summary' }, 'Vaste keuzelijsten voor objecten en werkorders. Een naam wijzigen past hem ook aan bij alle objecten of werkorders die hem gebruiken.'),
     h('div', { class: 'cards' }, STAM.map(([k, title, coll, field]) => {
-      const vals = (L[k] || (k === 'soorten' ? SOORT_WO : k === 'kostensoorten' ? KOSTEN : [])).slice();
+      const vals = (L[k] || (k === 'soorten' ? SOORT_WO : k === 'kostensoorten' ? KOSTEN : k === 'monteurs' ? MONTEURS : [])).slice();
       const used = countBy(D[coll], x => x[field]).filter(([v]) => v !== 'Onbekend');
       const useN = v => (used.find(u => u[0] === v) || [, 0])[1];
       const missing = used.map(u => u[0]).filter(v => !vals.includes(v));
@@ -967,183 +973,1025 @@ function editLocatie(l) {
 
 
 // =====================================================================
-// FACTURATIE
+// FACTURATIE – huur en kosten van equipment, doorbelast per project
 // =====================================================================
-const KOSTEN = ['Huur', 'Reparatie', 'Onderhoud', 'Keuring', 'Onderdelen', 'Overig'];
-const FSTATUS = ['Te controleren', 'Goedgekeurd', 'Betaald', 'Betwist'];
+const KOSTEN = ['Huur', 'Reparatie', 'Onderhoud', 'Keuring', 'Onderdelen', 'Transport', 'Overig'];
+const FSTATUS = ['Te controleren', 'Goedgekeurd', 'Betaald', 'Verwerkt', 'Betwist'];
+const PAID = ['Betaald', 'Verwerkt'];
 const kostensoorten = cur => { const l = (stamL().kostensoorten || []).length ? stamL().kostensoorten : KOSTEN; return cur && !l.includes(cur) ? l.concat([cur]) : l; };
 const eur = n => Number(n || 0).toLocaleString('nl-NL', { style: 'currency', currency: 'EUR' });
 const eur0 = n => Number(n || 0).toLocaleString('nl-NL', { style: 'currency', currency: 'EUR', maximumFractionDigits: 0 });
-const incl = f => Math.round(Number(f.bedrag_excl || 0) * (1 + Number(f.btw ?? 21) / 100) * 100) / 100;
+const r2 = n => Math.round(Number(n || 0) * 100) / 100;
+const btwOf = f => f.btw_bedrag != null ? Number(f.btw_bedrag) : r2(Number(f.bedrag_excl || 0) * Number(f.btw ?? 21) / 100);
+const incl = f => r2(Number(f.bedrag_excl || 0) + btwOf(f));
 const todayKey = () => dayKey(new Date());
-const isOverdue = f => f.status !== 'Betaald' && f.vervaldatum && f.vervaldatum < todayKey();
+const isOpen = f => !PAID.includes(f.status);
+const isOverdue = f => isOpen(f) && f.vervaldatum && f.vervaldatum < todayKey();
 const dmy = d => d ? d.split('-').reverse().join('-') : '';
-const fF = { q: '', st: '', lev: '', jaar: String(new Date().getFullYear()) };
+const dm = d => d ? d.slice(8, 10) + '-' + d.slice(5, 7) : '';
+const periode = f => f.periode_van || f.periode_tot ? `${dm(f.periode_van) || '?'} t/m ${dmy(f.periode_tot) || '?'}` : '';
+const projLabel = f => [f.project_rtm, f.project_naam].filter(Boolean).join(' · ');
+const equipLabel = f => { const o = f.object_id ? objById()[f.object_id] : null; return [f.vlootnummer || (o ? 'TWV' + o.twv : ''), f.equipment || (o ? o.omschrijving : '')].filter(Boolean).join(' · ') || f.object_tekst || ''; };
+const fF = { q: '', st: '', lev: '', jaar: String(new Date().getFullYear()), klant: '', mode: 'factuur', limit: 100 };
+function fnv36(s) { let h = 0x811c9dc5; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; } return h.toString(36); }
 function fBadge(f) {
-  if (f.status === 'Betaald') return h('span', { class: 'badge b-Afgerond' }, 'Betaald' + (f.betaald_op ? ' ' + dmy(f.betaald_op).slice(0, 5) : ''));
+  if (f.status === 'Betaald') return h('span', { class: 'badge b-Afgerond' }, 'Betaald' + (f.betaald_op ? ' ' + dm(f.betaald_op) : ''));
+  if (f.status === 'Verwerkt') return h('span', { class: 'badge b-grey' }, 'Verwerkt');
   if (isOverdue(f)) return h('span', { class: 'badge b-Open' }, 'Vervallen');
-  return h('span', { class: 'badge ' + ({ 'Te controleren': 'b-Hoog', 'Goedgekeurd': 'b-Behandeling', 'Betwist': 'b-Urgent' }[f.status] || 'b-grey') }, f.status);
+  return h('span', { class: 'badge ' + ({ 'Te controleren': 'b-Hoog', 'Goedgekeurd': 'b-Behandeling', 'Betwist': 'b-Urgent' }[f.status] || 'b-grey') }, f.status || '–');
 }
-function fObject(f) { const o = f.object_id ? objById()[f.object_id] : null;
-  return [o ? objName(o) + (o.type ? ' ' + o.type : '') : (f.object_tekst || ''), f.werkorder ? woNr(f.werkorder) : ''].filter(Boolean).join(' · ') || '–'; }
+function groupBadge(rows) { const st = [...new Set(rows.map(r => isOverdue(r) ? 'Vervallen' : r.status))]; return st.length === 1 ? fBadge(rows[0]) : h('span', { class: 'badge b-Hoog' }, rows.some(r => r.status === 'Te controleren') ? 'Deels te controleren' : 'Gemengd'); }
+
+function fFiltered() {
+  const q = fF.q.trim().toLowerCase();
+  return D.facturen.filter(f => (!fF.jaar || (f.factuurdatum || '').startsWith(fF.jaar) || (!f.factuurdatum && fF.jaar === String(new Date().getFullYear())))
+    && (!fF.lev || f.leverancier === fF.lev) && (!fF.klant || (f.klant || '–') === fF.klant)
+    && (!fF.st || (fF.st === 'open' ? isOpen(f) : fF.st === 'vervallen' ? isOverdue(f) : f.status === fF.st))
+    && (!q || [f.factuurnummer, f.leverancier, f.vlootnummer, f.equipment, f.project_rtm, f.project_naam, f.project_code, f.klant, f.opmerking].some(v => v && String(v).toLowerCase().includes(q))));
+}
 function viewFacturatie() {
-  const years = [...new Set(D.facturen.map(f => (f.factuurdatum || '').slice(0, 4)).filter(Boolean).concat([String(new Date().getFullYear())]))].sort().reverse();
-  const levs = [...new Set(D.facturen.map(f => f.leverancier).filter(Boolean))].sort();
-  const yr = String(new Date().getFullYear());
-  const thisYear = D.facturen.filter(f => (f.factuurdatum || '').startsWith(yr));
-  const open = D.facturen.filter(f => f.status !== 'Betaald');
-  const over = D.facturen.filter(isOverdue);
-  const tc = D.facturen.filter(f => f.status === 'Te controleren');
+  const yr = fF.jaar || 'alle jaren';
+  const all = D.facturen;
+  const years = [...new Set(all.map(f => (f.factuurdatum || '').slice(0, 4)).filter(y => y && y <= String(new Date().getFullYear() + 1)).concat([String(new Date().getFullYear())]))].sort().reverse();
+  const levs = [...new Set(all.map(f => f.leverancier).filter(Boolean))].sort();
+  const klanten = [...new Set(all.filter(f => !fF.jaar || (f.factuurdatum || '').startsWith(fF.jaar)).map(f => f.klant || '–'))].sort();
+  const inYear = all.filter(f => !fF.jaar || (f.factuurdatum || '').startsWith(fF.jaar));
+  const open = all.filter(isOpen), tc = all.filter(f => f.status === 'Te controleren');
   const tile = (c, l, n, x, onClick) => h('button', { class: 'tile ' + c, type: 'button', onclick: onClick }, h('div', { class: 'l' }, l), h('div', { class: 'n' }, n), h('div', { class: 'x' }, x));
-  const setSel = (k, v) => { fF[k] = v; viewFacturatie(); };
-  const sel = (k, label, opts) => h('select', { 'aria-label': label, onchange: e => setSel(k, e.target.value) }, opts.map(([v, t]) => h('option', { value: v, selected: fF[k] === v }, t)));
+  const set = (k, v) => { fF[k] = v; fF.limit = 100; viewFacturatie(); };
+  const sel = (k, label, opts) => h('select', { 'aria-label': label, onchange: e => set(k, e.target.value) }, opts.map(([v, t]) => h('option', { value: v, selected: fF[k] === v }, t)));
+  const modes = factModes();
+  const inlees = h('button', { class: 'btn sig', type: 'button', onclick: importPdfFacturen }, 'Facturen inlezen (PDF)');
+  if (fF.mode === 'monteurs' || fF.mode === 'doorbelasting') {
+    const head = h('div', { class: 'toolbar', style: 'justify-content:space-between' }, modes, h('div', { style: 'display:flex;gap:8px;flex-wrap:wrap' },
+      fF.mode === 'monteurs' ? sel('jaar', 'Jaar', years.map(y => [y, y]).concat([['', 'Alle jaren']])) : null, inlees));
+    return fF.mode === 'monteurs' ? viewMonteurs(head) : viewDoorbelasting(head);
+  }
   const body = h('div');
+  const search = h('input', { type: 'search', placeholder: 'Zoek op factuur, TWV, project, klant…', value: fF.q, oninput: e => { fF.q = e.target.value; fF.limit = 100; draw(); } });
   $('main').replaceChildren(
     h('div', { class: 'tiles' },
-      tile('sig', `Gefactureerd ${yr} (incl. btw)`, eur0(thisYear.reduce((s, f) => s + incl(f), 0)), `${thisYear.length} facturen`, () => setSel('st', '')),
-      tile('blu', 'Nog te betalen', eur0(open.reduce((s, f) => s + incl(f), 0)), `${open.length} facturen`, () => { fF.jaar = ''; setSel('st', 'open'); }),
-      tile(over.length ? 'red' : 'grn', 'Over de vervaldatum', eur0(over.reduce((s, f) => s + incl(f), 0)), over.length === 1 ? '1 factuur' : `${over.length} facturen`, () => { fF.jaar = ''; setSel('st', 'vervallen'); }),
-      tile('', 'Te controleren', tc.length, 'wachten op goedkeuring', () => { fF.jaar = ''; setSel('st', 'Te controleren'); })),
-    h('div', { class: 'toolbar' },
-      h('input', { type: 'search', placeholder: 'Zoek op factuurnummer, leverancier of TWV', value: fF.q, oninput: e => { fF.q = e.target.value; draw(); } }),
-      sel('st', 'Status', [['', 'Alle statussen'], ['open', 'Nog niet betaald'], ['vervallen', 'Vervallen']].concat(FSTATUS.map(s => [s, s]))),
-      sel('lev', 'Leverancier', [['', 'Alle leveranciers']].concat(levs.map(l => [l, l]))),
+      tile('sig', `Kosten ${yr} (excl. btw)`, eur0(inYear.reduce((s, f) => s + Number(f.bedrag_excl || 0), 0)), `${new Set(inYear.map(f => f.factuurnummer)).size} facturen · ${inYear.length} regels`, () => set('st', '')),
+      tile('blu', `Incl. btw ${yr}`, eur0(inYear.reduce((s, f) => s + incl(f), 0)), `${new Set(inYear.map(f => f.project_code || f.project_rtm).filter(Boolean)).size} projecten`, () => set('mode', 'project')),
+      tile(open.some(isOverdue) ? 'red' : '', 'Nog te betalen', eur0(open.reduce((s, f) => s + incl(f), 0)), `${new Set(open.map(f => f.factuurnummer)).size} facturen`, () => { fF.jaar = ''; set('st', 'open'); }),
+      tile(tc.length ? 'red' : 'grn', 'Te controleren', tc.length, tc.length ? 'regels met een vraag' : 'alles in orde', () => { fF.jaar = ''; fF.mode = 'regel'; set('st', 'Te controleren'); })),
+    h('div', { class: 'toolbar' }, search,
       sel('jaar', 'Jaar', years.map(y => [y, y]).concat([['', 'Alle jaren']])),
-      h('button', { class: 'btn alt', type: 'button', onclick: () => exportFacturen(list()) }, 'Kopiëren voor Excel'),
-      h('button', { class: 'btn sig', type: 'button', onclick: () => editFactuur(null) }, 'Nieuwe factuur')),
-    body, factPanels());
-  function list() {
-    const q = fF.q.trim().toLowerCase(); const ob = objById();
-    return D.facturen.filter(f => (!fF.jaar || (f.factuurdatum || '').startsWith(fF.jaar)) && (!fF.lev || f.leverancier === fF.lev)
-      && (!fF.st || (fF.st === 'open' ? f.status !== 'Betaald' : fF.st === 'vervallen' ? isOverdue(f) : f.status === fF.st))
-      && (!q || [f.factuurnummer, f.leverancier, f.omschrijving, f.object_tekst, ob[f.object_id]?.twv, f.werkorder ? woNr(f.werkorder) : ''].some(v => v && String(v).toLowerCase().includes(q))))
-      .sort((a, b) => (b.factuurdatum || '').localeCompare(a.factuurdatum || '') || (b.factuurnummer || '').localeCompare(a.factuurnummer || ''));
-  }
+      sel('klant', 'Klant', [['', 'Alle klanten']].concat(klanten.map(k => [k, k === '–' ? '(geen klant)' : k]))),
+      sel('st', 'Status', [['', 'Alle statussen'], ['open', 'Nog niet betaald'], ['vervallen', 'Vervallen']].concat(FSTATUS.map(s => [s, s]))),
+      levs.length > 1 ? sel('lev', 'Leverancier', [['', 'Alle leveranciers']].concat(levs.map(l => [l, l]))) : null),
+    h('div', { class: 'toolbar', style: 'justify-content:space-between' }, modes,
+      h('div', { style: 'display:flex;gap:8px;flex-wrap:wrap' },
+        h('button', { class: 'btn alt', type: 'button', onclick: importFacturen }, 'Importeren uit Excel'),
+        h('button', { class: 'btn alt', type: 'button', onclick: () => exportFacturen(fFiltered()) }, 'Kopiëren voor Excel'),
+        h('button', { class: 'btn alt', type: 'button', onclick: () => editFactuur(null) }, 'Nieuwe regel'), inlees)),
+    meldingBanner(), body, factPanels(inYear, yr));
   function draw() {
-    const rows = list();
-    if (!rows.length) { body.replaceChildren(h('div', { class: 'panel wide' }, h('div', { class: 'empty' }, D.facturen.length ? 'Geen facturen gevonden met deze filters.' : 'Nog geen facturen. Klik op “Nieuwe factuur” om de eerste in te voeren.'))); return; }
+    const rows = fFiltered();
+    if (fF.mode === 'heftruck') { body.replaceChildren(...heftruckTable(rows).filter(Boolean)); return; }
+    if (!rows.length) { body.replaceChildren(h('div', { class: 'panel wide' }, h('div', { class: 'empty' }, D.facturen.length ? 'Niets gevonden met deze filters.' : 'Nog geen facturen. Klik op “Nieuwe regel” of “Importeren uit Excel”.'))); return; }
     const sumE = rows.reduce((s, f) => s + Number(f.bedrag_excl || 0), 0), sumI = rows.reduce((s, f) => s + incl(f), 0);
-    body.replaceChildren(h('div', { class: 'panel wide', style: 'padding:6px 4px 4px' }, h('div', { class: 'tbl' }, h('table', {},
-      h('thead', {}, h('tr', {}, ['Factuurnr.', 'Datum', 'Leverancier', 'Object / werkorder', 'Soort', 'Excl. btw', 'Incl. btw', 'Vervalt', 'Status'].map((t, i) => h('th', { class: i === 5 || i === 6 ? 'num' : null }, t)))),
-      h('tbody', {}, rows.map(f => h('tr', { tabindex: '0', onclick: () => editFactuur(f), onkeydown: e => { if (e.key === 'Enter') editFactuur(f); } },
-        h('td', { style: 'font-weight:600' }, f.factuurnummer), h('td', {}, dmy(f.factuurdatum)), h('td', {}, f.leverancier || ''),
-        h('td', {}, fObject(f)), h('td', {}, f.soort || ''), h('td', { class: 'num' }, eur(f.bedrag_excl)), h('td', { class: 'num' }, eur(incl(f))),
-        h('td', { class: isOverdue(f) ? 'old' : null }, dmy(f.vervaldatum)), h('td', {}, fBadge(f))))))),
-      h('div', { class: 'summary', style: 'display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;padding:10px 12px 4px' },
-        h('span', {}, `${rows.length} facturen · klik op een regel om te openen`), h('b', { style: 'color:var(--ink)' }, `Totaal excl. ${eur(sumE)} · incl. ${eur(sumI)}`))));
+    let items, head, rowFn, label;
+    if (fF.mode === 'factuur') {
+      const g = new Map(); rows.forEach(f => { const k = (f.factuurnummer || '(zonder nummer)') + '|' + (f.leverancier || ''); if (!g.has(k)) g.set(k, []); g.get(k).push(f); });
+      items = [...g.values()].sort((a, b) => (b[0].factuurdatum || '').localeCompare(a[0].factuurdatum || '') || String(b[0].factuurnummer).localeCompare(String(a[0].factuurnummer)));
+      label = 'facturen';
+      head = ['Factuurnr.', 'Datum', 'Leverancier', 'Equipment', 'Periode', 'Projecten', 'Excl. btw', 'Incl. btw', 'Status'];
+      rowFn = rs => { const f = rs[0]; const eq = [...new Set(rs.map(equipLabel).filter(Boolean))]; const pr = [...new Set(rs.map(r => r.project_rtm || r.project_naam).filter(Boolean))];
+        const van = rs.map(r => r.periode_van).filter(Boolean).sort()[0], tot = rs.map(r => r.periode_tot).filter(Boolean).sort().pop();
+        return h('tr', { tabindex: '0', onclick: () => showFactuur(rs), onkeydown: e => { if (e.key === 'Enter') showFactuur(rs); } },
+          h('td', { style: 'font-weight:600;white-space:nowrap' }, f.factuurnummer || '(geen)'), h('td', { style: 'white-space:nowrap' }, dmy(f.factuurdatum)), h('td', {}, f.leverancier || ''),
+          h('td', {}, eq.length > 1 ? `${eq[0]} +${eq.length - 1}` : eq[0] || ''), h('td', { style: 'white-space:nowrap' }, van || tot ? `${dm(van)} t/m ${dmy(tot)}` : ''),
+          h('td', {}, pr.length === 1 ? pr[0] : `${pr.length} projecten`), h('td', { class: 'num' }, eur(rs.reduce((s, r) => s + Number(r.bedrag_excl || 0), 0))),
+          h('td', { class: 'num' }, eur(rs.reduce((s, r) => s + incl(r), 0))), h('td', {}, groupBadge(rs))); };
+    } else if (fF.mode === 'project') {
+      const g = new Map(); rows.forEach(f => { const k = f.project_code || f.project_rtm || f.project_naam || '(geen project)'; if (!g.has(k)) g.set(k, []); g.get(k).push(f); });
+      items = [...g.values()].sort((a, b) => b.reduce((s, r) => s + Number(r.bedrag_excl || 0), 0) - a.reduce((s, r) => s + Number(r.bedrag_excl || 0), 0));
+      label = 'projecten';
+      head = ['Project', 'Klant', 'Facturen', 'Regels', 'Uren', 'Excl. btw', 'Incl. btw'];
+      rowFn = rs => { const f = rs[0]; const go2 = () => { fF.q = f.project_rtm || f.project_naam || ''; fF.mode = 'regel'; fF.limit = 100; viewFacturatie(); };
+        return h('tr', { tabindex: '0', onclick: go2, onkeydown: e => { if (e.key === 'Enter') go2(); } },
+          h('td', { style: 'font-weight:600' }, projLabel(f) || '(geen project)'), h('td', {}, f.klant || '–'), h('td', { class: 'num' }, new Set(rs.map(r => r.factuurnummer)).size),
+          h('td', { class: 'num' }, rs.length), h('td', { class: 'num' }, fmt(rs.reduce((s, r) => s + Number(r.uren || 0), 0))),
+          h('td', { class: 'num' }, eur(rs.reduce((s, r) => s + Number(r.bedrag_excl || 0), 0))), h('td', { class: 'num' }, eur(rs.reduce((s, r) => s + incl(r), 0)))); };
+    } else {
+      items = rows.slice().sort((a, b) => (b.factuurdatum || '').localeCompare(a.factuurdatum || '') || String(b.factuurnummer || '').localeCompare(String(a.factuurnummer || '')));
+      label = 'regels';
+      head = ['Factuurnr.', 'Datum', 'Equipment', 'Periode', 'Project', 'Klant', 'Uren', 'Excl. btw', 'Status'];
+      rowFn = f => h('tr', { tabindex: '0', onclick: () => editFactuur(f), onkeydown: e => { if (e.key === 'Enter') editFactuur(f); } },
+        h('td', { style: 'font-weight:600;white-space:nowrap' }, f.factuurnummer || '(geen)'), h('td', { style: 'white-space:nowrap' }, dmy(f.factuurdatum)), h('td', {}, equipLabel(f)),
+        h('td', { style: 'white-space:nowrap' }, periode(f)), h('td', {}, projLabel(f)), h('td', {}, f.klant || ''), h('td', { class: 'num' }, f.uren != null ? fmt(f.uren) : ''),
+        h('td', { class: 'num' }, eur(f.bedrag_excl)), h('td', {}, fBadge(f)));
+    }
+    const shown = items.slice(0, fF.limit);
+    const numCols = { 'Excl. btw': 1, 'Incl. btw': 1, 'Uren': 1, 'Regels': 1, 'Facturen': 1 };
+    body.replaceChildren(h('div', { class: 'panel wide', style: 'padding:6px 4px 4px' },
+      h('div', { class: 'tbl' }, h('table', {}, h('thead', {}, h('tr', {}, head.map(t => h('th', { class: numCols[t] ? 'num' : null }, t)))), h('tbody', {}, shown.map(rowFn)))),
+      h('div', { class: 'summary', style: 'display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;padding:10px 12px 4px' },
+        h('span', {}, `${shown.length} van ${items.length} ${label}`, items.length > shown.length ? h('button', { class: 'link', type: 'button', style: 'margin-left:12px', onclick: () => { fF.limit += 200; draw(); } }, 'Meer tonen') : null),
+        h('b', { style: 'color:var(--ink)' }, `Totaal excl. ${eur(sumE)} · incl. ${eur(sumI)}`))));
   }
   draw();
 }
-function factPanels() {
+function factPanels(inYear, yr) {
   if (!D.facturen.length) return null;
-  const yr = String(new Date().getFullYear()); const ob = objById();
-  const fy = D.facturen.filter(f => (f.factuurdatum || '').startsWith(yr));
-  const months = []; const now = new Date(); for (let i = 11; i >= 0; i--) { const d = new Date(now.getFullYear(), now.getMonth() - i, 1); months.push([d.toISOString().slice(0, 7) === dayKey(d).slice(0, 7) ? dayKey(d).slice(0, 7) : dayKey(d).slice(0, 7), d.toLocaleDateString('nl-NL', { month: 'short', year: '2-digit' })]); }
+  const ob = objById();
   const sumBy = (arr, key) => { const m = {}; arr.forEach(f => { const k = key(f); if (k) m[k] = (m[k] || 0) + Number(f.bedrag_excl || 0); }); return m; };
-  const pm = sumBy(D.facturen, f => (f.factuurdatum || '').slice(0, 7));
   const top = (m, n) => Object.entries(m).sort((a, b) => b[1] - a[1]).slice(0, n);
   const bars = (rows, color) => { const max = Math.max(1, ...rows.map(r => r[1]));
     return h('div', {}, rows.map(([l, v]) => h('div', { class: 'hb' }, h('span', { title: l }, l), h('span', { class: 'tr' }, h('i', { style: `width:${v / max * 100}%;${color ? 'background:' + color : ''}` })), h('span', { class: 'v' }, eur0(v))))); };
+  const months = []; const now = new Date(); for (let i = 11; i >= 0; i--) { const d = new Date(now.getFullYear(), now.getMonth() - i, 1); months.push([dayKey(d).slice(0, 7), d.toLocaleDateString('nl-NL', { month: 'short', year: '2-digit' })]); }
+  const pm = sumBy(D.facturen, f => (f.factuurdatum || '').slice(0, 7));
   return h('div', { class: 'panels', style: 'margin-top:12px' },
-    h('div', { class: 'panel' }, h('h3', {}, 'Kosten per maand (excl. btw)'), bars(months.map(([k, l]) => [l, pm[k] || 0]))),
-    h('div', { class: 'panel' }, h('h3', {}, `Per leverancier (${yr})`), fy.length ? bars(top(sumBy(fy, f => f.leverancier), 8)) : h('p', { class: 'muted' }, 'Nog geen facturen dit jaar.')),
-    h('div', { class: 'panel' }, h('h3', {}, `Hoogste kosten per object (${yr})`), (() => { const t = top(sumBy(fy, f => f.object_id), 8); return t.length ? bars(t.map(([id, v]) => [ob[id] ? objName(ob[id]) + (ob[id].type ? ' ' + ob[id].type : '') : id, v]), 'var(--info)') : h('p', { class: 'muted' }, 'Nog geen facturen aan objecten gekoppeld.'); })()));
+    h('div', { class: 'panel' }, h('h3', {}, 'Kosten per maand, laatste 12 maanden'), bars(months.map(([k, l]) => [l, pm[k] || 0]))),
+    h('div', { class: 'panel' }, h('h3', {}, `Per klant (${yr})`), inYear.length ? bars(top(sumBy(inYear, f => f.klant || '(geen klant)'), 8)) : h('p', { class: 'muted' }, 'Geen gegevens.')),
+    h('div', { class: 'panel' }, h('h3', {}, `Per equipment (${yr})`), inYear.length ? bars(top(sumBy(inYear, f => f.vlootnummer || (ob[f.object_id] ? 'TWV' + ob[f.object_id].twv : null) || '(onbekend)'), 8), 'var(--info)') : h('p', { class: 'muted' }, 'Geen gegevens.')));
+}
+function showFactuur(rs) {
+  const f = rs[0];
+  const sumE = rs.reduce((s, r) => s + Number(r.bedrag_excl || 0), 0);
+  openDlg('Factuur ' + (f.factuurnummer || '(zonder nummer)'), [
+    h('div', { class: 'stats', style: 'grid-template-columns:repeat(3,1fr)' },
+      h('div', {}, h('b', {}, eur(sumE)), h('span', {}, 'excl. btw')), h('div', {}, h('b', {}, eur(rs.reduce((s, r) => s + btwOf(r), 0))), h('span', {}, 'btw')),
+      h('div', {}, h('b', {}, eur(rs.reduce((s, r) => s + incl(r), 0))), h('span', {}, 'totaal incl. btw'))),
+    h('div', { class: 'tbl' }, h('table', {},
+      h('thead', {}, h('tr', {}, ['Equipment', 'Periode', 'Project', 'Klant', 'Uren', 'Excl. btw', 'Status'].map(t => h('th', { class: ['Uren', 'Excl. btw'].includes(t) ? 'num' : null }, t)))),
+      h('tbody', {}, rs.map(r => h('tr', { tabindex: '0', onclick: () => editFactuur(r), onkeydown: e => { if (e.key === 'Enter') editFactuur(r); } },
+        h('td', {}, equipLabel(r)), h('td', { style: 'white-space:nowrap' }, periode(r)), h('td', {}, projLabel(r)), h('td', {}, r.klant || ''),
+        h('td', { class: 'num' }, r.uren != null ? fmt(r.uren) : ''), h('td', { class: 'num' }, eur(r.bedrag_excl)), h('td', {}, fBadge(r))))))),
+    rs.some(r => r.opmerking) ? h('div', { class: 'sec' }, h('h3', {}, 'Opmerkingen'), h('div', { class: 'log' }, rs.filter(r => r.opmerking).map(r => h('div', {}, r.opmerking, h('small', {}, equipLabel(r) + ' · ' + projLabel(r)))))) : null,
+    h('div', { class: 'actions' },
+      h('button', { class: 'btn sig', type: 'button', onclick: () => editFactuur(null, { factuurnummer: f.factuurnummer, leverancier: f.leverancier, leverancier_nr: f.leverancier_nr, factuurdatum: f.factuurdatum, vervaldatum: f.vervaldatum, status: f.status, soort: f.soort, vlootnummer: f.vlootnummer, equipment: f.equipment, object_id: f.object_id, periode_van: f.periode_van, periode_tot: f.periode_tot }) }, 'Regel toevoegen'),
+      rs.some(isOpen) ? h('button', { class: 'btn alt', type: 'button', onclick: async () => {
+        if (!await askConfirm(`Alle ${rs.length} regels van factuur ${f.factuurnummer} op “Betaald” zetten?`)) return;
+        const now = new Date().toISOString(), d = todayKey();
+        try { for (const r of rs.filter(isOpen)) { await col('facturen').doc(r.id).update({ status: 'Betaald', betaald_op: d, gewijzigd_op: now, gewijzigd_door: me || null }); Object.assign(r, { status: 'Betaald', betaald_op: d }); } } catch (e) { return fail(e, 'factuur'); }
+        updCounts(); toast('Factuur op betaald gezet'); showFactuur(rs); } }, 'Hele factuur betaald') : null)],
+    [f.leverancier, dmy(f.factuurdatum), `${rs.length} ${rs.length === 1 ? 'regel' : 'regels'}`].filter(Boolean).join(' · '));
 }
 function exportFacturen(rows) {
-  const head = ['Factuurnummer', 'Factuurdatum', 'Vervaldatum', 'Leverancier', 'Objectnummer', 'TWV', 'Werkorder', 'Soort', 'Bedrag excl', 'Btw %', 'Bedrag incl', 'Status', 'Betaald op', 'Kostenplaats', 'Omschrijving'];
-  const ob = objById(); const n = v => v == null ? '' : Number(v).toFixed(2).replace('.', ',');
-  const text = [head.join('\t')].concat(rows.map(f => [f.factuurnummer, dmy(f.factuurdatum), dmy(f.vervaldatum), f.leverancier, f.object_id || '', ob[f.object_id]?.twv || '', f.werkorder ? woNr(f.werkorder) : '', f.soort, n(f.bedrag_excl), f.btw ?? 21, n(incl(f)), isOverdue(f) ? 'Vervallen' : f.status, dmy(f.betaald_op), f.kostenplaats || '', (f.omschrijving || '').replace(/\s+/g, ' ')].map(x => x ?? '').join('\t'))).join('\n');
+  const head = ['Factuurnummer', 'Factuurdatum', 'Leverancier', 'Vlootnummer', 'Equipment', 'Begindatum', 'Einddatum', 'Projectcode', 'RTM-project', 'Projectnaam', 'Klant', 'Uren', 'Bedrag excl', 'Btw %', 'Btw bedrag', 'Totaal', 'Soort', 'Status', 'Opmerking'];
+  const n = v => v == null || v === '' ? '' : Number(v).toFixed(2).replace('.', ',');
+  const text = [head.join('\t')].concat(rows.slice().sort((a, b) => (a.factuurdatum || '').localeCompare(b.factuurdatum || '')).map(f => [f.factuurnummer, dmy(f.factuurdatum), f.leverancier, f.vlootnummer || (f.object_id && objById()[f.object_id] ? 'TWV' + objById()[f.object_id].twv : ''), f.equipment, dmy(f.periode_van), dmy(f.periode_tot), f.project_code, f.project_rtm, f.project_naam, f.klant, n(f.uren), n(f.bedrag_excl), f.btw ?? 21, n(btwOf(f)), n(incl(f)), f.soort, isOverdue(f) ? 'Vervallen' : f.status, (f.opmerking || '').replace(/\s+/g, ' ')].map(x => x ?? '').join('\t'))).join('\n');
   const ta = h('textarea', { readonly: true, style: 'height:200px;font:13px/1.3 ui-monospace,Menlo,Consolas,monospace' }, text);
-  openDlg('Kopiëren voor Excel', [h('p', { class: 'muted' }, `${rows.length} facturen (zoals nu gefilterd). Plak in een leeg tabblad in cel A1.`), ta,
+  openDlg('Kopiëren voor Excel', [h('p', { class: 'muted' }, `${rows.length} regels (zoals nu gefilterd), in dezelfde kolommen als de template. Plak in een leeg tabblad in cel A1.`), ta,
     h('div', { class: 'actions' }, h('button', { class: 'btn', type: 'button', onclick: async () => { if (!await copyText(text)) { ta.focus(); ta.select(); toast('Selecteer en kopieer de tekst zelf'); } } }, 'Kopiëren'))]);
 }
 function addDays(d, n) { const x = new Date(d + 'T12:00:00'); x.setDate(x.getDate() + n); return dayKey(x); }
+const projMap = () => Object.fromEntries(D.projecten.map(p => [p.id, p]));
+const pLabel = p => [p.rtm, p.naam].filter(Boolean).join(' · ') + (p.klant ? ' — ' + p.klant : '');
+function findObjectByVloot(v) { const m = String(v || '').match(/TWV\s*(\d{3,4})/i) || String(v || '').match(/^(\d{3,4})$/); if (!m) return null;
+  return D.objecten.find(o => o.twv === m[1] && o.status === 'Actief') || D.objecten.find(o => o.twv === m[1]) || null; }
 function editFactuur(f, preset) {
   const isNew = !f; f = f || Object.assign({ factuurdatum: todayKey(), vervaldatum: addDays(todayKey(), 30), btw: 21, status: 'Te controleren', soort: 'Huur' }, preset || {});
-  const ob = objById();
-  const objs = D.objecten.filter(o => o.status === 'Actief' || o.id === f.object_id).sort((a, b) => (Number(a.twv) || 1e9) - (Number(b.twv) || 1e9));
-  const olabel = o => [objName(o), o.type, o.locatie, o.id !== 'TWV' + o.twv ? o.id : null].filter(Boolean).join(' · ');
-  const omap = Object.fromEntries(objs.map(o => [olabel(o), o.id]));
+  const ob = objById(), pm = projMap();
+  const objs = D.objecten.filter(o => (o.status === 'Actief' && o.twv) || o.id === f.object_id).sort((a, b) => (Number(a.twv) || 1e9) - (Number(b.twv) || 1e9));
+  const olabel = o => [o.twv ? 'TWV' + o.twv : o.id, o.omschrijving, o.locatie].filter(Boolean).join(' · ');
+  const hist = [...new Map(D.facturen.filter(x => x.vlootnummer).map(x => [x.vlootnummer, x.equipment])).entries()].sort();
+  const eqOpts = new Map(); objs.forEach(o => eqOpts.set(olabel(o), { object_id: o.id, vlootnummer: 'TWV' + o.twv, equipment: o.omschrijving }));
+  hist.forEach(([v, e]) => { const lab = [v, e].filter(Boolean).join(' · '); if (![...eqOpts.keys()].some(k => k.startsWith(v + ' '))) eqOpts.set(lab, { vlootnummer: v, equipment: e, object_id: findObjectByVloot(v)?.id || null }); });
+  const projs = D.projecten.slice().sort((a, b) => (a.fase === 'Lopend' ? 0 : 1) - (b.fase === 'Lopend' ? 0 : 1) || Number(b.id) - Number(a.id));
+  const pOpts = new Map(projs.map(p => [pLabel(p), p]));
   const levs = [...new Set((stamL().leveranciers || []).concat(D.facturen.map(x => x.leverancier), D.objecten.map(o => o.leverancier)).filter(Boolean))].sort();
   const err = h('p', { class: 'err full' });
   const totaal = h('b', { style: 'font:700 26px "Barlow Condensed",sans-serif' });
   const inp = (name, label, attrs, full) => h('label', { class: full ? 'full' : null }, label, h('input', Object.assign({ name, value: f[name] ?? '', autocomplete: 'off' }, attrs || {})));
   const sel = (name, label, opts) => h('label', {}, label, h('select', { name }, opts.map(([v, t]) => h('option', { value: v, selected: String(f[name] ?? '') === String(v) }, t))));
+  const curEq = equipLabel(f), curP = f.project_code && pm[f.project_code] ? pLabel(pm[f.project_code]) : [f.project_rtm, f.project_naam].filter(Boolean).join(' · ');
+  const sub = t => h('div', { class: 'full', style: 'font:700 17px "Barlow Condensed",sans-serif;color:var(--muted);margin-top:6px' }, t);
   const form = h('form', { class: 'grid', onsubmit: e => e.preventDefault() },
+    sub('Factuur'),
     inp('factuurnummer', 'Factuurnummer *'),
     h('label', {}, 'Leverancier *', h('input', { name: 'leverancier', value: f.leverancier || '', list: 'flevs', autocomplete: 'off' }), h('datalist', { id: 'flevs' }, levs.map(l => h('option', { value: l })))),
     inp('factuurdatum', 'Factuurdatum *', { type: 'date' }), inp('vervaldatum', 'Vervaldatum', { type: 'date' }),
+    sub('Equipment en periode'),
+    h('label', { class: 'full' }, 'Equipment / vlootnummer', h('input', { name: 'eq', list: 'feqs', autocomplete: 'off', placeholder: 'Typ TWV-nummer of omschrijving', value: curEq }), h('datalist', { id: 'feqs' }, [...eqOpts.keys()].map(k => h('option', { value: k })))),
+    inp('periode_van', 'Huur van', { type: 'date' }), inp('periode_tot', 'Huur tot en met', { type: 'date' }),
+    sub('Doorbelasting'),
+    h('label', { class: 'full' }, 'Project', h('input', { name: 'proj', list: 'fprojs', autocomplete: 'off', placeholder: 'Typ projectnummer, schip of klant', value: curP }), h('datalist', { id: 'fprojs' }, [...pOpts.keys()].map(k => h('option', { value: k })))),
+    inp('uren', 'Uren', { inputmode: 'decimal', value: f.uren != null ? fmt(f.uren) : '' }),
+    h('label', {}, 'Werkorder (optioneel)', h('input', { name: 'wo', list: 'fwos', autocomplete: 'off', placeholder: 'bv. WO-00012', value: f.werkorder ? woNr(f.werkorder) : '' }), h('datalist', { id: 'fwos' }, D.werkorders.slice().sort((a, b) => b.id - a.id).map(w => h('option', { value: woNr(w.id) }, w.titel)))),
+    sub('Bedrag'),
     inp('bedrag_excl', 'Bedrag excl. btw *', { inputmode: 'decimal', value: f.bedrag_excl != null ? Number(f.bedrag_excl).toLocaleString('nl-NL', { minimumFractionDigits: 2 }) : '', style: 'text-align:right;font-weight:600' }),
     sel('btw', 'Btw', [[21, '21%'], [9, '9%'], [0, '0% / verlegd']]),
     h('div', { class: 'full', style: 'display:flex;justify-content:space-between;align-items:center;background:var(--bg);border-radius:8px;padding:10px 14px' }, h('span', { class: 'muted' }, 'Totaal incl. btw'), totaal),
     sel('soort', 'Soort kosten', kostensoorten(f.soort).map(s => [s, s])), sel('status', 'Status', FSTATUS.map(s => [s, s])),
-    h('label', {}, 'Object (optioneel)', h('input', { name: 'obj', list: 'fobjs', autocomplete: 'off', placeholder: 'Typ TWV-nummer', value: f.object_id && ob[f.object_id] ? olabel(ob[f.object_id]) : (f.object_tekst || '') }), h('datalist', { id: 'fobjs' }, objs.map(o => h('option', { value: olabel(o) })))),
-    h('label', {}, 'Werkorder (optioneel)', h('input', { name: 'wo', list: 'fwos', autocomplete: 'off', placeholder: 'bv. WO-00012', value: f.werkorder ? woNr(f.werkorder) : '' }), h('datalist', { id: 'fwos' }, D.werkorders.slice().sort((a, b) => b.id - a.id).map(w => h('option', { value: woNr(w.id) }, w.titel)))),
     inp('betaald_op', 'Betaald op', { type: 'date' }), inp('kostenplaats', 'Kostenplaats (optioneel)'),
-    h('label', { class: 'full' }, 'Omschrijving / opmerking', h('textarea', { name: 'omschrijving' }, f.omschrijving || '')), err);
+    h('label', { class: 'full' }, 'Opmerking', h('textarea', { name: 'opmerking' }, f.opmerking || '')), err);
   const E = form.elements;
-  const calc = () => { const v = parseNum(E.bedrag_excl.value); totaal.textContent = Number.isNaN(v) || v == null ? '–' : eur(incl({ bedrag_excl: v, btw: E.btw.value })); };
-  E.bedrag_excl.addEventListener('input', calc); E.btw.addEventListener('change', calc); calc();
+  let btwChanged = false;
+  const calc = () => { const v = parseNum(E.bedrag_excl.value); const keep = !btwChanged && f.btw_bedrag != null && v === Number(f.bedrag_excl);
+    totaal.textContent = Number.isNaN(v) || v == null ? '–' : eur(keep ? incl(f) : r2(v * (1 + Number(E.btw.value) / 100))); };
+  E.bedrag_excl.addEventListener('input', () => { btwChanged = true; calc(); }); E.btw.addEventListener('change', () => { btwChanged = true; calc(); }); calc();
   let autoVerval = !f.vervaldatum || f.vervaldatum === addDays(f.factuurdatum || todayKey(), 30);
   E.vervaldatum.addEventListener('input', () => { autoVerval = false; });
   E.factuurdatum.addEventListener('change', () => { if (autoVerval && E.factuurdatum.value) E.vervaldatum.value = addDays(E.factuurdatum.value, 30); });
   E.status.addEventListener('change', () => { if (E.status.value === 'Betaald' && !E.betaald_op.value) E.betaald_op.value = todayKey(); });
   const save = async () => {
     err.textContent = '';
-    const nr = E.factuurnummer.value.trim(), lev = E.leverancier.value.trim(), bd = parseNum(E.bedrag_excl.value);
+    const nr = E.factuurnummer.value.trim(), lev = E.leverancier.value.trim(), bd = parseNum(E.bedrag_excl.value), ur = parseNum(E.uren.value);
     if (!nr || !lev) { err.textContent = 'Vul factuurnummer en leverancier in.'; return; }
     if (!E.factuurdatum.value) { err.textContent = 'Vul de factuurdatum in.'; return; }
-    if (bd == null || Number.isNaN(bd)) { err.textContent = 'Vul een geldig bedrag in, bijvoorbeeld 1.150,00'; return; }
-    const dup = D.facturen.find(x => x.id !== f.id && (x.factuurnummer || '').toLowerCase() === nr.toLowerCase() && (x.leverancier || '').toLowerCase() === lev.toLowerCase());
-    if (dup && !await askConfirm(`Factuur ${nr} van ${lev} bestaat al. Toch opslaan?`)) return;
-    const ov = E.obj.value.trim(); const ok = ov.replace(/^twv\s*/i, '').split(/\s|·/)[0]; const oid = omap[ov] || D.objecten.find(o => o.id === ov || o.id.toLowerCase() === ov.toLowerCase())?.id || D.objecten.find(o => o.twv && o.twv === ok && o.status === 'Actief')?.id || D.objecten.find(o => o.twv && o.twv === ok)?.id || null;
+    if (bd == null || Number.isNaN(bd)) { err.textContent = 'Vul een geldig bedrag in, bijvoorbeeld 1.400,00'; return; }
+    if (Number.isNaN(ur)) { err.textContent = 'Uren is geen getal.'; return; }
+    if (E.periode_van.value && E.periode_tot.value && E.periode_tot.value < E.periode_van.value) { err.textContent = 'De einddatum van de huur ligt vóór de begindatum.'; return; }
+    const ev = E.eq.value.trim(); let eq = eqOpts.get(ev);
+    if (!eq && ev) { const parts = ev.split('·').map(x => x.trim()); const o = findObjectByVloot(parts[0]); eq = { vlootnummer: parts[0], equipment: parts.slice(1).join(' · ') || (o ? o.omschrijving : null), object_id: o ? o.id : null }; }
+    const pv = E.proj.value.trim(); let p = pOpts.get(pv) || D.projecten.find(x => x.rtm === pv || x.id === pv) || null;
     const wm = E.wo.value.match(/(\d+)/); const wid = wm ? Number(wm[1]) : null;
     if (wid && !D.werkorders.some(w => w.id === wid)) { err.textContent = `Werkorder ${E.wo.value} bestaat niet.`; return; }
-    const rec = { factuurnummer: nr, leverancier: lev, factuurdatum: E.factuurdatum.value, vervaldatum: E.vervaldatum.value || null, bedrag_excl: bd, btw: Number(E.btw.value),
-      soort: E.soort.value, status: E.status.value, object_id: oid, object_tekst: oid ? null : (ov || null), werkorder: wid,
-      betaald_op: E.status.value === 'Betaald' ? (E.betaald_op.value || todayKey()) : (E.betaald_op.value || null),
-      kostenplaats: E.kostenplaats.value.trim() || null, omschrijving: E.omschrijving.value.trim() || null, gewijzigd_op: new Date().toISOString(), gewijzigd_door: me || null };
-    if (isNew) rec.aangemaakt_op = rec.gewijzigd_op;
-    const id = isNew ? 'f' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6) : f.id;
-    try { await col('facturen').doc(id).set(isNew ? rec : Object.assign({}, Object.fromEntries(Object.entries(f).filter(([k]) => !['id', '_id'].includes(k))), rec)); } catch (e) { return fail(e, 'factuur'); }
-    const i = D.facturen.findIndex(x => x.id === id); const nf = Object.assign({ id, _id: id }, f, rec); if (i >= 0) D.facturen[i] = nf; else D.facturen.push(nf);
-    updCounts(); toast(isNew ? 'Factuur toegevoegd' : 'Opgeslagen'); dlg.close();
+    const sameBtw = !btwChanged && f.btw_bedrag != null && bd === Number(f.bedrag_excl);
+    const rec = { factuurnummer: nr, leverancier: lev, factuurdatum: E.factuurdatum.value, vervaldatum: E.vervaldatum.value || null,
+      vlootnummer: eq ? eq.vlootnummer || null : null, equipment: eq ? eq.equipment || null : null, object_id: eq ? eq.object_id || null : null,
+      periode_van: E.periode_van.value || null, periode_tot: E.periode_tot.value || null,
+      project_code: p ? p.id : null, project_rtm: p ? p.rtm || null : null, project_naam: p ? p.naam || null : (pv || null), klant: p ? p.klant || null : null,
+      uren: ur, werkorder: wid, bedrag_excl: bd, btw: Number(E.btw.value), btw_bedrag: sameBtw ? f.btw_bedrag : null,
+      soort: E.soort.value, status: E.status.value, betaald_op: E.status.value === 'Betaald' ? (E.betaald_op.value || todayKey()) : (E.betaald_op.value || null),
+      kostenplaats: E.kostenplaats.value.trim() || null, opmerking: E.opmerking.value.trim() || null, gewijzigd_op: new Date().toISOString(), gewijzigd_door: me || null };
+    if (isNew) { rec.aangemaakt_op = rec.gewijzigd_op; rec.bron = 'Handmatig'; if (f.leverancier_nr) rec.leverancier_nr = f.leverancier_nr; }
+    const dup = isNew && D.facturen.find(x => x.factuurnummer === nr && x.leverancier === lev && x.vlootnummer === rec.vlootnummer && (x.project_code || '') === (rec.project_code || '') && Number(x.bedrag_excl) === bd);
+    if (dup && !await askConfirm(`Er bestaat al een regel op factuur ${nr} met hetzelfde equipment, project en bedrag. Toch opslaan?`)) return;
+    const id = isNew ? 'm' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6) : f.id;
+    const data = Object.assign({}, isNew ? {} : Object.fromEntries(Object.entries(f).filter(([k]) => !['id', '_id'].includes(k))), rec);
+    for (const k in data) if (data[k] === null) delete data[k];
+    try { await col('facturen').doc(id).set(data); } catch (e) { return fail(e, 'factuur'); }
+    const i = D.facturen.findIndex(x => x.id === id); const nf = Object.assign({ id, _id: id }, data); if (i >= 0) D.facturen[i] = nf; else D.facturen.push(nf);
+    updCounts(); toast(isNew ? 'Regel toegevoegd' : 'Opgeslagen'); dlg.close();
   };
   const del = async () => {
-    if (!await askConfirm(`Factuur ${f.factuurnummer} van ${f.leverancier} verwijderen?`)) return;
+    if (!await askConfirm(`Deze regel van factuur ${f.factuurnummer} (${eur(f.bedrag_excl)}) verwijderen?`)) return;
     try { await col('facturen').doc(f.id).delete(); } catch (e) { return fail(e, 'factuur'); }
     D.facturen = D.facturen.filter(x => x.id !== f.id); updCounts(); toast('Verwijderd'); dlg.close();
   };
-  openDlg(isNew ? 'Nieuwe factuur' : 'Factuur ' + f.factuurnummer, [form, h('div', { class: 'actions' },
+  openDlg(isNew ? (preset && preset.factuurnummer ? 'Regel toevoegen aan ' + preset.factuurnummer : 'Nieuwe factuurregel') : 'Factuur ' + f.factuurnummer, [form, h('div', { class: 'actions' },
     h('button', { class: 'btn', type: 'button', onclick: save }, 'Opslaan'),
     !isNew ? h('button', { class: 'btn danger', type: 'button', onclick: del }, 'Verwijderen') : null)],
-    isNew ? 'Velden met * zijn verplicht' : [f.leverancier, f.gewijzigd_op ? 'gewijzigd ' + dt(f.gewijzigd_op) + (f.gewijzigd_door ? ' door ' + who(f.gewijzigd_door) : '') : ''].filter(Boolean).join(' · '));
-  setTimeout(() => E[isNew ? 'factuurnummer' : 'status'].focus(), 50);
+    isNew ? 'Velden met * zijn verplicht. Eén factuur over meerdere projecten? Maak per project een regel.' : [f.bron, f.gewijzigd_op ? 'gewijzigd ' + dt(f.gewijzigd_op) + (f.gewijzigd_door ? ' door ' + who(f.gewijzigd_door) : '') : ''].filter(Boolean).join(' · '));
+  setTimeout(() => E[isNew && !(preset && preset.factuurnummer) ? 'factuurnummer' : isNew ? 'proj' : 'status'].focus(), 50);
 }
+
+// ---- Importeren uit Excel (plakken) ----
+const IMPORT_COLS = {
+  factuurnummer: ['factuurnummer', 'factuur', 'factuurnr', 'invoice'], factuurdatum: ['factuurdatum', 'datum'], vervaldatum: ['vervaldatum'],
+  leverancier: ['leverancier', 'supplier'], leverancier_nr: ['leveranciernummer', 'supplieraccount', 'debiteurnummer', 'crediteurnummer'],
+  vlootnummer: ['vlootnummer', 'twv', 'twvnummer'], equipment: ['equipment', 'omschrijving'], periode_van: ['begindatum', 'huurvan', 'van'], periode_tot: ['einddatum', 'huurtot', 'tot', 'huurtotenmet'],
+  project_code: ['projectcode'], project_rtm: ['rtmproject', 'rtm'], project_naam: ['projectnaam', 'project'], klant: ['klant', 'customername', 'klantnaam'],
+  uren: ['uren'], bedrag_excl: ['bedragexcl', 'bedragexclbtw', 'exclbtw', 'bedrag'], btw: ['btw', 'btwpercentage', 'btwprocent'], btw_bedrag: ['btwbedrag'],
+  soort: ['soort', 'soortkosten'], status: ['status'], opmerking: ['opmerking', 'opmerkingen', 'kolom1'], kostenplaats: ['kostenplaats']
+};
+function parseDateNL(s) {
+  s = String(s || '').trim(); if (!s) return null;
+  let m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/); if (m) return `${m[1]}-${m[2].padStart(2, '0')}-${m[3].padStart(2, '0')}`;
+  m = s.match(/^(\d{1,2})[-/.](\d{1,2})[-/.](\d{2,4})/); if (m) { const y = m[3].length === 2 ? '20' + m[3] : m[3]; return `${y}-${m[2].padStart(2, '0')}-${m[1].padStart(2, '0')}`; }
+  if (/^\d{5}$/.test(s)) { const d = new Date(Date.UTC(1899, 11, 30) + Number(s) * 864e5); return d.toISOString().slice(0, 10); }
+  return 'ONGELDIG';
+}
+function parseImport(text) {
+  const lines = text.replace(/\r/g, '').split('\n').filter(l => l.trim());
+  if (lines.length < 2) return { error: 'Plak de kopregel én minstens één regel uit Excel.' };
+  const norm = s => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+  const head = lines[0].split('\t').map(norm);
+  const idx = {}; for (const [k, names] of Object.entries(IMPORT_COLS)) { const i = head.findIndex(h0 => names.includes(h0)); if (i >= 0) idx[k] = i; }
+  // "Project" in de oude lijst is de projectnaam, "Totaal" wordt herberekend
+  const missing = ['factuurnummer', 'leverancier', 'bedrag_excl'].filter(k => idx[k] == null);
+  if (missing.length) return { error: 'Kolommen niet gevonden: ' + missing.join(', ') + '. Gebruik de kopregel uit de template.' };
+  const pm = projMap(); const byRtm = Object.fromEntries(D.projecten.filter(p => p.rtm).map(p => [p.rtm, p]));
+  const rows = [], problems = []; const occ = {};
+  lines.slice(1).forEach((line, n) => {
+    const c = line.split('\t'); const g = k => idx[k] != null ? (c[idx[k]] || '').trim() : '';
+    if (!c.some(x => x.trim())) return;
+    const num = k => { let t = g(k).replace(/[€\s]/g, ''); if (/,\d{3}(\.|$)/.test(t) && /\.\d{1,2}$/.test(t)) t = t.replace(/,/g, ''); return parseNum(t); };
+    const r = { factuurnummer: g('factuurnummer').replace(/\.0$/, ''), leverancier: g('leverancier'), leverancier_nr: g('leverancier_nr') || null,
+      factuurdatum: parseDateNL(g('factuurdatum')), vervaldatum: parseDateNL(g('vervaldatum')), vlootnummer: g('vlootnummer') || null, equipment: g('equipment') || null,
+      periode_van: parseDateNL(g('periode_van')), periode_tot: parseDateNL(g('periode_tot')), project_code: g('project_code').replace(/\.0$/, '') || null, project_rtm: g('project_rtm') || null,
+      project_naam: g('project_naam') || null, klant: g('klant') || null, uren: num('uren'), bedrag_excl: num('bedrag_excl'), btw_bedrag: num('btw_bedrag'),
+      btw: g('btw') ? parseNum(g('btw').replace('%', '')) : null, soort: g('soort') || 'Huur', status: g('status') || 'Te controleren', opmerking: g('opmerking') || null, kostenplaats: g('kostenplaats') || null };
+    const issues = [];
+    if (!r.factuurnummer) issues.push('geen factuurnummer');
+    if (!r.leverancier) issues.push('geen leverancier');
+    if (r.bedrag_excl == null || Number.isNaN(r.bedrag_excl)) issues.push('geen geldig bedrag');
+    for (const k of ['factuurdatum', 'vervaldatum', 'periode_van', 'periode_tot']) if (r[k] === 'ONGELDIG') { issues.push('ongeldige datum (' + k.replace('_', ' ') + ')'); r[k] = null; }
+    if (Number.isNaN(r.uren)) { issues.push('uren geen getal'); r.uren = null; }
+    if (Number.isNaN(r.btw_bedrag)) r.btw_bedrag = null;
+    if (r.btw == null || Number.isNaN(r.btw)) r.btw = r.btw_bedrag != null && r.bedrag_excl ? Math.round(r.btw_bedrag / r.bedrag_excl * 100) : 21;
+    if (!FSTATUS.includes(r.status)) r.status = 'Te controleren';
+    const keyProj = r.project_code || r.project_rtm || '';
+    const p = (r.project_code && pm[r.project_code]) || (r.project_rtm && byRtm[r.project_rtm]);
+    if (p) { r.project_code = p.id; r.project_rtm = r.project_rtm || p.rtm || null; r.project_naam = r.project_naam || p.naam || null; r.klant = r.klant || p.klant || null; }
+    const o = findObjectByVloot(r.vlootnummer); if (o) r.object_id = o.id;
+    if (/^TECHNO WEST|^DE FEYTER/.test(r.leverancier)) r.leverancier = r.leverancier.toLowerCase().replace(/\b\w/g, x => x.toUpperCase());
+    if (issues.length) problems.push(`Regel ${n + 2}: ${issues.join(', ')}`);
+    const key = [r.factuurnummer, r.vlootnummer || '', keyProj, r.periode_van || '', (r.bedrag_excl || 0).toFixed(2)].join('|');
+    occ[key] = (occ[key] || 0) + 1;
+    r.id = 'r' + fnv36(key) + '-' + occ[key];
+    if (!issues.some(i => /factuurnummer|leverancier|bedrag/.test(i))) rows.push(r);
+  });
+  return { rows, problems };
+}
+function importFacturen() {
+  const ta = h('textarea', { style: 'height:180px;font:13px/1.3 ui-monospace,Menlo,Consolas,monospace', placeholder: 'Selecteer in Excel de kopregel en alle regels (Ctrl+C) en plak ze hier (Ctrl+V).' });
+  const out = h('div'); const btns = h('div', { class: 'actions' });
+  const check = () => {
+    const res = parseImport(ta.value); btns.replaceChildren(h('button', { class: 'btn alt', type: 'button', onclick: check }, 'Controleren'));
+    if (res.error) { out.replaceChildren(h('p', { class: 'err' }, res.error)); return; }
+    const exist = new Set(D.facturen.map(f => f.id)); const nNew = res.rows.filter(r => !exist.has(r.id)).length;
+    out.replaceChildren(
+      h('div', { class: 'stats', style: 'grid-template-columns:repeat(3,1fr)' },
+        h('div', {}, h('b', {}, res.rows.length), h('span', {}, 'regels klaar om te importeren')), h('div', {}, h('b', {}, nNew), h('span', {}, 'nieuw (rest wordt bijgewerkt)')),
+        h('div', {}, h('b', {}, eur0(res.rows.reduce((s, r) => s + Number(r.bedrag_excl || 0), 0))), h('span', {}, 'totaal excl. btw'))),
+      res.problems.length ? h('div', { class: 'msg care', style: 'border-radius:8px;padding:10px;background:var(--care-bg);color:var(--care);max-height:140px;overflow:auto;font-size:14px' },
+        h('b', {}, `${res.problems.length} regels met een opmerking (regels zonder factuurnummer, leverancier of bedrag worden overgeslagen):`), res.problems.slice(0, 50).map(p => h('div', {}, p))) : null);
+    if (res.rows.length) btns.append(h('button', { class: 'btn sig', type: 'button', onclick: async e => {
+      e.currentTarget.disabled = true; const now = new Date().toISOString(); let n = 0;
+      try {
+        for (const r of res.rows) {
+          const id = r.id; delete r.id;
+          const data = Object.assign({}, r, { bron: 'Import uit Excel', gewijzigd_op: now, gewijzigd_door: me || null });
+          for (const k in data) if (data[k] === null) delete data[k];
+          await col('facturen').doc(id).set(data);
+          const i = D.facturen.findIndex(x => x.id === id); const nf = Object.assign({ id, _id: id }, data); if (i >= 0) D.facturen[i] = nf; else D.facturen.push(nf);
+          if (++n % 10 === 0) e.currentTarget.textContent = `Bezig… ${n}/${res.rows.length}`;
+        }
+      } catch (x) { return fail(x, 'import'); }
+      updCounts(); toast(`${n} regels geïmporteerd`); dlg.close(); } }, `Importeren (${res.rows.length} regels)`));
+  };
+  btns.append(h('button', { class: 'btn', type: 'button', onclick: check }, 'Controleren'));
+  openDlg('Importeren uit Excel', [h('p', { class: 'muted' }, 'Werkt met de template “Facturatie-template.xlsx” en met de oude lijst. Kopieer in Excel de kopregel plus de regels die je wilt toevoegen, en plak ze hieronder. Projecten en klanten worden automatisch aangevuld via de projectcode. Plak je dezelfde regels nog eens, dan worden ze bijgewerkt in plaats van dubbel toegevoegd.'), ta, out, btns]);
+  setTimeout(() => ta.focus(), 50);
+}
+
 function kostenBlok(o) {
   const fs = D.facturen.filter(f => f.object_id === o.id).sort((a, b) => (b.factuurdatum || '').localeCompare(a.factuurdatum || ''));
   const yr = String(new Date().getFullYear());
   const fy = fs.filter(f => (f.factuurdatum || '').startsWith(yr));
   const sumY = fy.reduce((s, f) => s + Number(f.bedrag_excl || 0), 0), sumT = fs.reduce((s, f) => s + Number(f.bedrag_excl || 0), 0);
-  // draaiuren dit jaar uit de urenstanden
   const per = Object.fromEntries(D.periodes.map(p => [p.id, p]));
   const ur = D.uren.filter(u => u.object_id === o.id && u.waarde != null && per[u.periode_id]).sort((a, b) => per[a.periode_id].datum.localeCompare(per[b.periode_id].datum));
   const inY = ur.filter(u => per[u.periode_id].datum.startsWith(yr));
   const hrs = inY.length >= 2 ? Number(inY[inY.length - 1].waarde) - Number(inY[0].waarde) : null;
-  const perSoort = {}; fy.forEach(f => perSoort[f.soort || 'Overig'] = (perSoort[f.soort || 'Overig'] || 0) + Number(f.bedrag_excl || 0));
+  const perKlant = {}; fy.forEach(f => perKlant[f.klant || f.soort || 'Overig'] = (perKlant[f.klant || f.soort || 'Overig'] || 0) + Number(f.bedrag_excl || 0));
   return h('div', { class: 'sec' },
-    h('h3', { style: 'display:flex;justify-content:space-between;align-items:baseline' }, `Kosten (${fs.length})`, h('button', { class: 'link', type: 'button', onclick: () => editFactuur(null, { object_id: o.id }) }, 'Factuur toevoegen')),
+    h('h3', { style: 'display:flex;justify-content:space-between;align-items:baseline;gap:12px' }, `Kosten (${fs.length} regels)`, h('span', { style: 'display:flex;gap:14px' }, h('button', { class: 'link', type: 'button', onclick: () => showDossier(o.id) }, 'Dossier & documenten'), h('button', { class: 'link', type: 'button', onclick: () => editFactuur(null, { object_id: o.id, vlootnummer: o.twv ? 'TWV' + o.twv : null, equipment: o.omschrijving }) }, 'Factuurregel toevoegen'))),
     fs.length ? [
       h('div', { class: 'stats', style: 'grid-template-columns:repeat(3,1fr)' },
         h('div', {}, h('b', {}, eur0(sumY)), h('span', {}, `${yr} (excl. btw)`)), h('div', {}, h('b', {}, eur0(sumT)), h('span', {}, 'totaal')),
         h('div', {}, h('b', {}, hrs > 0 ? eur(sumY / hrs) : '–'), h('span', {}, 'per draaiuur ' + yr))),
-      Object.keys(perSoort).length ? h('div', { class: 'chipset' }, Object.entries(perSoort).map(([k, v]) => h('span', { class: 'badge b-grey' }, `${k} ${eur0(v)}`))) : null,
+      Object.keys(perKlant).length ? h('div', { class: 'chipset' }, Object.entries(perKlant).sort((a, b) => b[1] - a[1]).slice(0, 6).map(([k, v]) => h('span', { class: 'badge b-grey' }, `${k} ${eur0(v)}`))) : null,
       h('div', { class: 'list' }, fs.slice(0, 8).map(f => h('button', { class: 'item', type: 'button', onclick: () => editFactuur(f) },
         h('div', { class: 't', style: 'font-size:17px' }, `${f.factuurnummer} · ${eur(f.bedrag_excl)}`),
-        h('div', { class: 's' }, [dmy(f.factuurdatum), f.leverancier, f.soort, f.werkorder ? woNr(f.werkorder) : ''].filter(Boolean).join('  ·  ')),
+        h('div', { class: 's' }, [dmy(f.factuurdatum), periode(f), projLabel(f), f.klant].filter(Boolean).join('  ·  ')),
         h('div', { class: 'r' }, fBadge(f))))),
-      fs.length > 8 ? h('p', { class: 'summary' }, `en nog ${fs.length - 8} oudere facturen (zie Facturatie)`) : null
+      fs.length > 8 ? h('button', { class: 'link', type: 'button', onclick: () => { dlg.close(); go('facturatie', { q: o.twv ? 'TWV' + o.twv : o.id, mode: 'regel', jaar: '', st: '', klant: '', lev: '' }); } }, `Alle ${fs.length} regels bekijken in Facturatie`) : null
     ] : h('p', { class: 'muted' }, 'Nog geen facturen aan dit object gekoppeld.'));
+}
+
+// =====================================================================
+// FACTURATIE – UITBREIDINGEN: per heftruck, dossier, documenten, meldingen,
+// PDF inlezen, monteurs & uurloon, doorbelasting per project
+// =====================================================================
+const MONTEURS = ['Maarten Sonius', 'Arjen Witte'];
+const monteurs = () => (stamL().monteurs || []).length ? stamL().monteurs : MONTEURS;
+const DOCSOORTEN = ['Factuur', 'Creditnota', 'Huurcontract', 'Keuringsrapport', 'Werkbon', 'Overig'];
+const NOT_TRUCK = /oplader|robot|accu|lader|rolde|nooduit|vliegen|automatiser|interne/i;
+const IS_WEB = () => !!window.SM_WEB;
+const modelCode = s => { const m = String(s || '').toUpperCase().match(/\b([EHRTPDLKN])\s?([\dOS]{2})/); return m ? m[1] + m[2].replace(/O/g, '0').replace(/S/g, '5') : null; };
+const objCode = o => modelCode(o.type) || modelCode(o.omschrijving);
+const truckLabel = o => o ? [(o.twv ? 'TWV ' + o.twv : o.id), o.type].filter(Boolean).join(' ') : '';
+const monthKey = d => (d || '').slice(0, 7);
+const monthName = k => k ? new Date(k + '-15T12:00:00').toLocaleDateString('nl-NL', { month: 'long', year: 'numeric' }) : '';
+const loaded = {};
+function loadScript(src) { return loaded[src] || (loaded[src] = new Promise((res, rej) => { const s = document.createElement('script'); s.src = src; const t = setTimeout(() => { delete loaded[src]; rej(new Error('Laden duurt te lang. Controleer je internetverbinding.')); }, 30000); s.onload = () => { clearTimeout(t); res(); }; s.onerror = () => { clearTimeout(t); delete loaded[src]; rej(new Error('Kon ' + src.split('/npm/')[1] + ' niet laden')); }; document.head.appendChild(s); })); }
+let FILES;
+async function files() { if (FILES === undefined) { try { FILES = (window.claude && claude.use) ? await claude.use('files') : null; } catch (e) { FILES = null; } } return FILES; }
+async function needFiles() { const f = await files(); if (!f) toast('Documenten opslaan werkt in de website (Vercel + Supabase), niet in deze voorbeeldversie.'); return f; }
+const docsFor = nr => D.documenten.filter(d => d.factuurnummer && d.factuurnummer === nr);
+const hasDoc = nr => D.documenten.some(d => d.factuurnummer === nr);
+async function openDoc(d) { const f = await needFiles(); if (!f) return; try { const u = await f.url(d.pad); window.open(u, '_blank', 'noopener'); } catch (e) { fail(e, 'document'); } }
+function factModes() {
+  return h('div', { class: 'chips', style: 'margin:0' }, [['factuur', 'Per factuur'], ['regel', 'Per regel'], ['project', 'Per project'], ['heftruck', 'Per heftruck'], ['monteurs', 'Monteurs & uurloon'], ['doorbelasting', 'Doorbelasting']].map(([k, l]) =>
+    h('button', { type: 'button', 'aria-pressed': String(fF.mode === k), onclick: () => { fF.mode = k; fF.limit = 100; viewFacturatie(); } }, l)));
+}
+function meldingBanner() {
+  const m = D.facturen.filter(f => f.melding && !f.melding.gesloten);
+  if (!m.length) return null;
+  const n = new Set(m.map(f => (f.factuurnummer || '') + '|' + (f.melding.type === 'verzamel' ? '' : f.vlootnummer))).size;
+  return h('div', { style: 'display:flex;gap:12px;align-items:center;background:var(--care-bg);color:var(--care);border-radius:10px;padding:10px 14px;margin-bottom:12px;flex-wrap:wrap' },
+    h('span', { style: 'flex:1 1 300px' }, h('b', {}, `${n} ${n === 1 ? 'melding' : 'meldingen'} bij ingelezen facturen`), ' – de facturen zijn al opgeslagen, dit is alleen ter controle.'),
+    h('button', { class: 'btn', type: 'button', onclick: showMeldingen }, 'Bekijken'));
+}
+
+// ---------------------------------------------------------------- per heftruck
+function heftruckRows(rows) {
+  const ob = objById(); const g = new Map();
+  rows.forEach(f => { if (!f.object_id || !ob[f.object_id]) return; if (!g.has(f.object_id)) g.set(f.object_id, []); g.get(f.object_id).push(f); });
+  return [...g.entries()].map(([id, rs]) => ({ o: ob[id], rs, kosten: rs.reduce((s, r) => s + Number(r.bedrag_excl || 0), 0) })).sort((a, b) => b.kosten - a.kosten);
+}
+function heftruckTable(rows) {
+  const items = heftruckRows(rows);
+  const unlinked = D.facturen.filter(f => !f.object_id && f.vlootnummer && !/^VLOOT$/i.test(f.vlootnummer));
+  const banner = unlinked.length ? h('div', { style: 'display:flex;gap:12px;align-items:center;background:var(--care-bg);color:var(--care);border-radius:10px;padding:10px 14px;margin-bottom:12px;flex-wrap:wrap' },
+    h('span', { style: 'flex:1 1 300px' }, h('b', {}, `${unlinked.length} factuurregels zijn nog niet aan een heftruck gekoppeld`), ` (${new Set(unlinked.map(f => f.vlootnummer)).size} vlootnummers, vaak oude trucks). Koppel ze per vlootnummer.`),
+    h('button', { class: 'btn', type: 'button', onclick: koppelDialog }, 'Koppelen')) : null;
+  if (!items.length) return [banner, h('div', { class: 'panel wide' }, h('div', { class: 'empty' }, 'Geen facturen aan heftrucks gekoppeld met deze filters.'))];
+  const shown = items.slice(0, fF.limit);
+  return [banner, h('div', { class: 'panel wide', style: 'padding:6px 4px 4px' },
+    h('div', { class: 'tbl' }, h('table', {},
+      h('thead', {}, h('tr', {}, ['Heftruck', 'Locatie', 'Leverancier', 'Facturen', 'Kosten', 'Per maand', 'Laatste factuur', 'Documenten'].map((t, i) => h('th', { class: [3, 4, 5].includes(i) ? 'num' : null }, t)))),
+      h('tbody', {}, shown.map(({ o, rs, kosten }) => {
+        const nrs = [...new Set(rs.map(r => r.factuurnummer).filter(Boolean))]; const withDoc = nrs.filter(hasDoc).length;
+        const months = new Set(rs.map(r => monthKey(r.factuurdatum)).filter(Boolean)).size || 1;
+        const last = rs.map(r => r.factuurdatum).filter(Boolean).sort().pop();
+        const cls = !nrs.length ? 'b-grey' : withDoc === nrs.length ? 'b-Afgerond' : withDoc ? 'b-Hoog' : 'b-Open';
+        return h('tr', { tabindex: '0', onclick: () => showDossier(o.id), onkeydown: e => { if (e.key === 'Enter') showDossier(o.id); } },
+          h('td', {}, h('b', {}, o.twv ? 'TWV ' + o.twv : o.id), ' ', h('span', { class: 'muted' }, o.type || '')), h('td', {}, [o.locatie, o.dc].filter(Boolean).join(' ')),
+          h('td', {}, rs[0].leverancier || o.leverancier || ''), h('td', { class: 'num' }, nrs.length), h('td', { class: 'num', style: 'font-weight:600' }, eur0(kosten)),
+          h('td', { class: 'num' }, eur0(kosten / months)), h('td', {}, dmy(last)), h('td', {}, h('span', { class: 'badge ' + cls }, `${withDoc} van ${nrs.length}`)));
+      })))),
+    h('div', { class: 'summary', style: 'display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;padding:10px 12px 4px' },
+      h('span', {}, `${shown.length} van ${items.length} heftrucks · klik voor het dossier`, items.length > shown.length ? h('button', { class: 'link', type: 'button', style: 'margin-left:12px', onclick: () => { fF.limit += 200; viewFacturatie(); } }, 'Meer tonen') : null),
+      h('span', {}, h('b', { style: 'color:var(--ink)' }, 'Documenten'), ' = facturen met een PDF')))];
+}
+function koppelDialog() {
+  const g = new Map(); D.facturen.filter(f => !f.object_id && f.vlootnummer && !/^VLOOT$/i.test(f.vlootnummer)).forEach(f => { if (!g.has(f.vlootnummer)) g.set(f.vlootnummer, []); g.get(f.vlootnummer).push(f); });
+  const objs = D.objecten.filter(o => !NOT_TRUCK.test(o.objecttype || '')).sort((a, b) => (Number(a.twv) || 1e9) - (Number(b.twv) || 1e9));
+  const lab = o => [o.twv ? 'TWV' + o.twv : o.id, o.omschrijving, o.status !== 'Actief' ? '(' + o.status + ')' : ''].filter(Boolean).join(' · ');
+  const map = Object.fromEntries(objs.map(o => [lab(o), o.id]));
+  const rows = [...g.entries()].sort((a, b) => b[1].length - a[1].length).map(([v, rs]) => {
+    const inp = h('input', { list: 'kobjs', placeholder: 'Kies object…', autocomplete: 'off' });
+    return h('div', { class: 'val', style: 'grid-template-columns:150px 1fr minmax(180px,260px) auto auto;gap:10px' },
+      h('b', {}, v), h('span', { class: 'c' }, `${rs.length} regels · ${rs[0].equipment || ''} · ${eur0(rs.reduce((s, r) => s + Number(r.bedrag_excl || 0), 0))}`), inp,
+      h('button', { type: 'button', onclick: async () => { const id = map[inp.value]; if (!id) return toast('Kies een object uit de lijst');
+        try { for (const r of rs) { await col('facturen').doc(r.id).update({ object_id: id }); r.object_id = id; } } catch (e) { return fail(e, 'koppelen'); } toast(`${rs.length} regels gekoppeld`); koppelDialog(); } }, 'Koppelen'),
+      h('button', { type: 'button', onclick: () => nieuweTruck(v, rs[0].equipment, rs[0].leverancier, rs) }, 'Nieuwe truck'));
+  });
+  openDlg('Factuurregels koppelen aan heftrucks', rows.length ? [h('datalist', { id: 'kobjs' }, objs.map(o => h('option', { value: lab(o) }))), h('div', { class: 'vals' }, rows)] : h('div', { class: 'empty' }, 'Alles is gekoppeld.'),
+    'Alle regels met hetzelfde vlootnummer worden in één keer gekoppeld. Oude trucks die niet meer in Objecten staan, kun je als nieuw (inactief) object aanmaken.');
+}
+let afterObjectSave = null;
+function nieuweTruck(vloot, equipment, leverancier, lines) {
+  const m = String(vloot || '').match(/(\d{3,4})/);
+  afterObjectSave = async id => { try { for (const r of lines || []) { const upd = { object_id: id }; if (r.melding && r.melding.type === 'niet_gevonden') upd.melding = null; await col('facturen').doc(r.id).update(upd); Object.assign(r, upd); } } catch (e) { fail(e, 'koppelen'); } };
+  editObject(null, { twv: m ? m[1] : '', type: modelCode(equipment) || '', omschrijving: [equipment, m ? 'TWV ' + m[1] : vloot].filter(Boolean).join(' '), merk: /linde/i.test(equipment || '') ? 'Linde' : '', objecttype: 'Heftrucks', leverancier: leverancier || '', eigendom: 'Huur', urenregistratie: false });
+}
+
+// ---------------------------------------------------------------- dossier
+let dosTab = 'facturen';
+function showDossier(oid) {
+  const o = objById()[oid]; if (!o) return;
+  const rs = D.facturen.filter(f => f.object_id === oid).sort((a, b) => (b.factuurdatum || '').localeCompare(a.factuurdatum || ''));
+  const yr = String(new Date().getFullYear()); const fy = rs.filter(f => (f.factuurdatum || '').startsWith(yr));
+  const sumY = fy.reduce((s, f) => s + Number(f.bedrag_excl || 0), 0);
+  const per = Object.fromEntries(D.periodes.map(p => [p.id, p]));
+  const ur = D.uren.filter(u => u.object_id === oid && u.waarde != null && per[u.periode_id] && per[u.periode_id].datum.startsWith(yr)).sort((a, b) => per[a.periode_id].datum.localeCompare(per[b.periode_id].datum));
+  const hrs = ur.length >= 2 ? Number(ur[ur.length - 1].waarde) - Number(ur[0].waarde) : null;
+  const nrs = [...new Set(rs.map(r => r.factuurnummer).filter(Boolean))]; const zonder = nrs.filter(n => !hasDoc(n)).length;
+  const months = new Set(fy.map(r => monthKey(r.factuurdatum))).size || 1;
+  const docs = D.documenten.filter(d => d.object_id === oid || (d.object_ids || []).includes(oid) || (d.factuurnummer && nrs.includes(d.factuurnummer)));
+  const arbeid = D.arbeid.filter(a => (a.verdeling || []).some(v => v.object_id === oid));
+  const fileInp = h('input', { type: 'file', multiple: true, accept: 'application/pdf,image/*', style: 'display:none', onchange: e => uploadDocs([...e.target.files], { object_id: oid }) });
+  const drop = h('div', { style: 'border:2px dashed var(--line);border-radius:12px;padding:18px;text-align:center;color:var(--muted);cursor:pointer;margin:12px 0', onclick: () => fileInp.click(),
+    ondragover: e => { e.preventDefault(); e.currentTarget.style.borderColor = 'var(--signal)'; }, ondragleave: e => { e.currentTarget.style.borderColor = 'var(--line)'; },
+    ondrop: e => { e.preventDefault(); uploadDocs([...e.dataTransfer.files], { object_id: oid }); } },
+    h('b', { style: 'color:var(--ink)' }, 'Sleep facturen of documenten hierheen'), ' (PDF of foto) of klik om te kiezen. Ze komen automatisch bij ', truckLabel(o), '.', fileInp);
+  const g = new Map(); rs.forEach(r => { const k = r.factuurnummer || r.id; if (!g.has(k)) g.set(k, []); g.get(k).push(r); });
+  const tabs = h('div', { class: 'ptabs', role: 'tablist' }, [['facturen', `Facturen (${nrs.length})`], ['documenten', `Documenten (${docs.length})`], ['monteurs', `Onderhoud monteurs (${arbeid.length})`]].map(([k, l]) =>
+    h('button', { type: 'button', role: 'tab', 'aria-selected': String(dosTab === k), onclick: () => { dosTab = k; showDossier(oid); } }, l)));
+  let body;
+  if (dosTab === 'facturen') body = g.size ? h('div', { class: 'tbl' }, h('table', {},
+    h('thead', {}, h('tr', {}, ['', 'Factuurnr.', 'Datum', 'Periode · project', 'Excl. btw', 'Document'].map((t, i) => h('th', { class: i === 4 ? 'num' : null }, t)))),
+    h('tbody', {}, [...g.entries()].slice(0, 60).map(([nr, ls]) => { const d = docsFor(nr)[0]; const f = ls[0];
+      return h('tr', {}, h('td', {}, h('span', { class: 'badge ' + (d ? 'b-Open' : 'b-grey') }, d ? 'PDF' : '—')), h('td', { style: 'font-weight:600' }, nr),
+        h('td', {}, dmy(f.factuurdatum)), h('td', {}, [periode(f), ...new Set(ls.map(projLabel).filter(Boolean))].filter(Boolean).join(' · ')),
+        h('td', { class: 'num' }, eur(ls.reduce((s, r) => s + Number(r.bedrag_excl || 0), 0))),
+        h('td', {}, d ? h('button', { class: 'link', type: 'button', onclick: () => openDoc(d) }, 'Bekijken') :
+          h('button', { class: 'link', type: 'button', style: 'color:var(--care);font-weight:600', onclick: () => { const fi = h('input', { type: 'file', accept: 'application/pdf,image/*', onchange: e => uploadDocs([...e.target.files], { object_id: oid, factuurnummer: nr }) }); fi.click(); } }, 'PDF toevoegen')));
+    })))) : h('p', { class: 'muted' }, 'Nog geen facturen bij deze heftruck.');
+  else if (dosTab === 'documenten') body = docs.length ? h('div', { class: 'vals' }, docs.sort((a, b) => (b.op || '').localeCompare(a.op || '')).map(d =>
+    h('div', { class: 'val', style: 'grid-template-columns:1fr auto auto auto' }, h('span', {}, h('b', {}, d.naam), ' ', h('span', { class: 'c' }, [d.soort, d.factuurnummer ? 'factuur ' + d.factuurnummer : '', dt(d.op)].filter(Boolean).join(' · '))),
+      h('span', { class: 'c' }, d.grootte ? Math.round(d.grootte / 1024) + ' kB' : ''), h('button', { type: 'button', onclick: () => openDoc(d) }, 'Bekijken'),
+      h('button', { type: 'button', onclick: async () => { if (!await askConfirm(`${d.naam} verwijderen?`)) return; try { const f = await files(); if (f) await f.remove(d.pad).catch(() => { }); await col('documenten').doc(d.id).delete(); D.documenten = D.documenten.filter(x => x !== d); } catch (e) { return fail(e, 'document'); } showDossier(oid); } }, 'Verwijder')))) : h('p', { class: 'muted' }, 'Nog geen documenten.');
+  else body = arbeid.length ? h('div', { class: 'vals' }, arbeid.map(a => { const v = a.verdeling.find(x => x.object_id === oid); const rate = a.uren ? a.arbeid / a.uren : 0;
+    return h('div', { class: 'val', style: 'grid-template-columns:1fr auto auto' }, h('span', {}, h('b', {}, a.monteur), ' ', h('span', { class: 'c' }, `${dmy(a.factuurdatum)} · factuur ${a.factuurnummer}${v.werkorder ? ' · ' + woNr(v.werkorder) : ''}`)), h('span', {}, fmt(v.uren) + ' u'), h('b', {}, eur(v.uren * rate))); })) : h('p', { class: 'muted' }, 'Nog geen monteursuren op deze heftruck.');
+  openDlg(truckLabel(o) + (o.omschrijving && !o.omschrijving.includes(o.type || '§') ? ' · ' + o.omschrijving : ''), [
+    h('div', { class: 'stats', style: 'grid-template-columns:repeat(4,1fr)' },
+      h('div', {}, h('b', {}, eur0(sumY)), h('span', {}, `kosten ${yr} (excl.)`)), h('div', {}, h('b', {}, eur0(sumY / months)), h('span', {}, 'gemiddeld per maand')),
+      h('div', {}, h('b', {}, hrs > 0 ? eur(sumY / hrs) : '–'), h('span', {}, 'per draaiuur')),
+      h('div', { style: zonder ? 'background:var(--care-bg)' : '' }, h('b', { style: zonder ? 'color:var(--care)' : '' }, zonder ? `${zonder} zonder PDF` : 'Compleet'), h('span', {}, `van ${nrs.length} facturen`))),
+    drop, tabs, body,
+    h('div', { class: 'actions' }, h('button', { class: 'btn alt', type: 'button', onclick: () => showObject(oid) }, 'Object openen'), h('button', { class: 'btn alt', type: 'button', onclick: () => editFactuur(null, { object_id: oid, vlootnummer: o.twv ? 'TWV' + o.twv : null, equipment: o.omschrijving }) }, 'Factuurregel toevoegen'))],
+    [o.id, [o.locatie, o.dc].filter(Boolean).join(' '), o.eigendom, o.leverancier].filter(Boolean).join(' · '));
+}
+async function uploadDocs(list, ctx) {
+  list = list.filter(f => /pdf|image/.test(f.type) || /\.(pdf|jpe?g|png)$/i.test(f.name));
+  if (!list.length) return toast('Kies een PDF of foto');
+  if (list.some(f => f.size > 10 * 1024 * 1024)) return toast('Bestanden mogen maximaal 10 MB zijn');
+  const fs = await needFiles(); if (!fs) return;
+  const own = [...new Set(D.facturen.filter(f => ctx.object_id ? f.object_id === ctx.object_id : true).map(f => f.factuurnummer).filter(Boolean))].sort().reverse();
+  const allNr = new Set(D.facturen.map(f => f.factuurnummer));
+  const rows = list.map(file => {
+    const digits = (file.name.match(/\d{5,10}/g) || []).find(d => allNr.has(d));
+    const guess = ctx.factuurnummer || digits || '';
+    const sel = h('select', {}, h('option', { value: '' }, 'Geen factuur'), [...new Set([guess, ...own].filter(Boolean))].map(n => {
+      const f = D.facturen.find(x => x.factuurnummer === n); return h('option', { value: n, selected: n === guess }, `${n}${f ? ' · ' + dmy(f.factuurdatum) : ''}${hasDoc(n) ? ' (heeft al PDF)' : ''}`); }));
+    const soort = h('select', {}, DOCSOORTEN.map(s => h('option', { selected: s === (guess || /factuur/i.test(file.name) ? 'Factuur' : 'Overig') }, s)));
+    return { file, sel, soort, el: h('div', { class: 'panel', style: 'background:var(--bg);display:grid;grid-template-columns:1fr 1fr;gap:8px' },
+      h('b', { class: 'full', style: 'grid-column:1/-1' }, file.name, ' ', h('span', { class: 'muted', style: 'font-weight:400' }, Math.round(file.size / 1024) + ' kB', digits ? ' · factuurnummer herkend in de naam' : '')),
+      h('label', {}, 'Soort', soort), h('label', {}, 'Hoort bij factuur', sel)) };
+  });
+  const save = async e => {
+    e.currentTarget.disabled = true; let n = 0;
+    try {
+      for (const r of rows) {
+        const id = 'd' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+        const safe = r.file.name.replace(/[^\w.\-]+/g, '_').slice(-80);
+        const pad = `${ctx.object_id || 'algemeen'}/${id}-${safe}`;
+        await fs.upload(pad, r.file, r.file.type || 'application/octet-stream');
+        const nr = r.sel.value || null; const objIds = nr ? [...new Set(D.facturen.filter(f => f.factuurnummer === nr && f.object_id).map(f => f.object_id))] : [];
+        const doc = { naam: r.file.name, pad, grootte: r.file.size, mime: r.file.type || null, soort: r.soort.value, factuurnummer: nr, object_id: ctx.object_id || objIds[0] || null, object_ids: objIds.length ? objIds : (ctx.object_id ? [ctx.object_id] : []), arbeid_id: ctx.arbeid_id || null, op: new Date().toISOString(), door: me || null };
+        for (const k in doc) if (doc[k] === null) delete doc[k];
+        await col('documenten').doc(id).set(doc); D.documenten.push(Object.assign({ id, _id: id }, doc)); n++;
+      }
+    } catch (x) { return fail(x, 'upload'); }
+    toast(`${n} ${n === 1 ? 'document' : 'documenten'} opgeslagen`); if (ctx.object_id) showDossier(ctx.object_id); else dlg.close();
+  };
+  openDlg('Document toevoegen', [h('div', { class: 'list' }, rows.map(r => r.el)), h('div', { class: 'actions' }, h('button', { class: 'btn', type: 'button', onclick: save }, rows.length === 1 ? 'Opslaan' : `${rows.length} documenten opslaan`))],
+    ctx.object_id ? truckLabel(objById()[ctx.object_id]) : 'PDF, JPG of PNG · max. 10 MB per bestand');
+}
+
+// ---------------------------------------------------------------- meldingen
+function showMeldingen() {
+  const ob = objById();
+  const list = D.facturen.filter(f => f.melding && !f.melding.gesloten);
+  const seen = new Set(); const cards = [];
+  const sluit = async rs => { try { for (const r of rs) { await col('facturen').doc(r.id).update({ melding: Object.assign({}, r.melding, { gesloten: true }) }); r.melding = Object.assign({}, r.melding, { gesloten: true }); } } catch (e) { return fail(e, 'melding'); } updCounts(); showMeldingen(); };
+  list.forEach(f => {
+    const m = f.melding; const key = m.type === 'verzamel' ? 'v' + f.factuurnummer : f.id; if (seen.has(key)) return; seen.add(key);
+    const rs = m.type === 'verzamel' ? list.filter(x => x.factuurnummer === f.factuurnummer && x.melding.type === 'verzamel') : [f];
+    const o = f.object_id ? ob[f.object_id] : null;
+    const kleur = m.type === 'type' || m.type === 'niet_gevonden' ? 'var(--warn)' : 'var(--care)';
+    const btns = [];
+    if (m.type === 'type' && o) btns.push(h('button', { class: 'btn', type: 'button', onclick: async () => { try { await col('objecten').doc(o.id).update({ type: m.factuur_code, gewijzigd_op: new Date().toISOString(), gewijzigd_door: me || null }); o.type = m.factuur_code; } catch (e) { return fail(e, 'object'); } await sluit(rs); toast(`${truckLabel(o)} aangepast`); } }, `Object aanpassen naar ${m.factuur_code}`));
+    if (m.type === 'niet_gevonden') btns.push(h('button', { class: 'btn', type: 'button', onclick: () => nieuweTruck(f.vlootnummer, f.equipment, f.leverancier, rs) }, 'Nieuwe truck aanmaken'));
+    if (m.type !== 'verzamel') btns.push(h('button', { class: 'btn alt', type: 'button', onclick: () => editFactuur(f) }, m.type === 'niet_gevonden' ? 'Bestaand object kiezen' : 'Ander object kiezen'));
+    if (m.type === 'dubbel' && m.andere) m.andere.forEach(id => ob[id] && btns.push(h('button', { class: 'btn alt', type: 'button', onclick: () => showObject(id) }, `${id} bekijken`)));
+    btns.push(h('button', { class: 'btn alt', type: 'button', onclick: () => sluit(rs) }, 'Klopt zo, melding sluiten'));
+    cards.push(h('div', { class: 'panel', style: `border-left:6px solid ${kleur};background:var(--surface);box-shadow:0 0 0 1px var(--line)` },
+      h('h3', {}, m.type === 'verzamel' ? `Verzamelfactuur ${f.factuurnummer} · ${rs.length} trucks` : `${f.vlootnummer} · factuur ${f.factuurnummer}`, h('span', { class: 'badge ' + (kleur === 'var(--warn)' ? 'b-Open' : 'b-Hoog') }, { type: 'Type anders', dubbel: 'Dubbel nummer', niet_gevonden: 'Niet gevonden', verzamel: 'Controleren' }[m.type])),
+      h('p', { style: 'margin:0 0 10px' }, m.tekst), h('div', { class: 'actions', style: 'margin-top:0' }, btns)));
+  });
+  openDlg('Meldingen bij ingelezen facturen', cards.length ? h('div', { class: 'list' }, cards) : h('div', { class: 'empty' }, 'Geen openstaande meldingen.'), 'De facturen staan al in Facturatie en zijn gekoppeld aan de best passende truck.');
+}
+
+// ---------------------------------------------------------------- PDF inlezen
+const OCR = { pdfjs: 'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js', pdfjsWorker: 'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js',
+  tess: 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js', tessWorker: 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/worker.min.js',
+  tessCore: 'https://cdn.jsdelivr.net/npm/tesseract.js-core@5.1.1', lang: 'https://cdn.jsdelivr.net/npm/@tesseract.js-data/nld@1.0.0/4.0.0_best_int', pdflib: 'https://cdn.jsdelivr.net/npm/pdf-lib@1.17.1/dist/pdf-lib.min.js' };
+function parseInvoiceText(txt) {
+  const T = txt.replace(/\r/g, '');
+  const amt = s => { if (s == null) return null; s = String(s).replace(/[^\d.,-]/g, ''); if (!s) return null;
+    if (/,\d{2}$/.test(s)) s = s.replace(/\./g, '').replace(',', '.'); else if (/\.\d{2}$/.test(s)) s = s.replace(/,/g, ''); const n = Number(s); return isFinite(n) ? n : null; };
+  const d2 = s => { const m = String(s || '').match(/(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})/); if (!m) return null; const y = m[3].length === 2 ? '20' + m[3] : m[3]; return `${y}-${m[2].padStart(2, '0')}-${m[1].padStart(2, '0')}`; };
+  const fix = s => s.replace(/[Oo]/g, '0').replace(/[lI|]/g, '1').replace(/S/g, '5').replace(/B/g, '8');
+  const g = re => { const m = T.match(re); return m ? m[1] : null; };
+  const r = { leverancier: /techno\s*west/i.test(T) ? 'Techno West Verhuur' : (/de\s*feyter/i.test(T) ? 'De Feyter' : null) };
+  const nr = g(/Factuurnumm\w*\s*[^\d\n]{0,6}([\dOolI|SB]{6,10})/i); r.factuurnummer = nr ? fix(nr) : null;
+  r.factuurdatum = d2(g(/Factuurdatum\s*[^\d\n]{0,6}([\d\/\-.]{6,10})/i));
+  const per = T.match(/Huurperiode\s*:?\s*(\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4})\s*t\s*\/?\s*m\s*(\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4})/i);
+  r.periode_van = per ? d2(per[1]) : null; r.periode_tot = per ? d2(per[2]) : null;
+  const model = T.match(/\b(Linde|Kalmar|Terberg|Konecranes|Svetruck|Mafi|Toyota|Jungheinrich|Still)\s+([A-Z0-9][A-Z0-9\/\- .]{1,24})/i);
+  r.model = model ? (model[1][0].toUpperCase() + model[1].slice(1).toLowerCase() + ' ' + model[2].trim().split(/\s{2,}/)[0]).trim() : null;
+  r.vlootnummers = [...new Set([...T.matchAll(/T\s?W\s?V\s?[-.]?\s?([\dOolI|SB]{4})\b/gi)].map(m => 'TWV' + fix(m[1])))];
+  r.excl = amt(g(/Totaal\s+excl\.?\s*BTW\s*[€E]?\s*([\d.,]+)/i));
+  r.btw_bedrag = amt(g(/Totaal\s+BTW\s*[^\d\n]{0,4}([\d.,]+)/i));
+  r.totaal = amt(g(/Totaal\s+factuurbedrag\s*[€E]?\s*([\d.,]+)/i));
+  const huur = T.match(/\bHuur\s+([\d.,]+)\s+([\d.,]+)\s+([\d.,]+)/i);
+  r.huur = huur ? { aantal: amt(huur[1]), prijs: amt(huur[2]), bedrag: amt(huur[3]) } : null;
+  r.extra = [...T.matchAll(/(Transport[^\n]*?)\s+([\d.,]+)\s+([\d.,]+)\s+([\d.,]+)\s*$/gim)].map(m => ({ omschrijving: m[1].trim(), bedrag: amt(m[4]) }));
+  r.omschrijving = (g(/Datum:?\s*\d{1,2}\/\d{1,2}\/\d{2,4}\s*_?\s*([^\n]+)/i) || '').replace(/[\s._]+$/, '').trim() || null;
+  if (r.excl == null && r.huur) r.excl = r.huur.bedrag + r.extra.reduce((s, x) => s + (x.bedrag || 0), 0);
+  if (r.btw_bedrag == null && r.excl != null) r.btw_bedrag = Math.round(r.excl * 21) / 100;
+  r.btw = r.excl ? Math.round(r.btw_bedrag / r.excl * 100) : 21;
+  r.zeker = !!(r.factuurnummer && r.factuurdatum && r.excl != null && r.vlootnummers.length && (r.totaal == null || Math.abs(r.excl + r.btw_bedrag - r.totaal) < 0.05));
+  return r;
+}
+function matchTruck(vloot, code) {
+  const m = String(vloot).match(/(\d{3,4})/); if (!m) return { obj: null, melding: { type: 'niet_gevonden', tekst: `${vloot} is geen geldig TWV-nummer.` } };
+  const cand = D.objecten.filter(o => o.twv === m[1] && !NOT_TRUCK.test(o.objecttype || '') && !/oplader/i.test(o.omschrijving || ''));
+  if (!cand.length) return { obj: null, melding: { type: 'niet_gevonden', factuur_code: code, tekst: `${vloot} staat niet in Objecten. De factuur is opgeslagen zonder truck.` } };
+  const act = cand.filter(o => o.status === 'Actief'); const pool = act.length ? act : cand;
+  const same = pool.filter(o => objCode(o) === code);
+  const obj = same[0] || pool[0];
+  const others = cand.filter(o => o !== obj).map(o => o.id);
+  if (code && objCode(obj) && objCode(obj) !== code) return { obj, melding: { type: 'type', factuur_code: code, object_code: objCode(obj), andere: others, tekst: `Op de factuur staat ${code}, in Objecten staat ${obj.id} als ${objCode(obj)}${others.length ? ` (er zijn nog ${others.length} objecten met dit nummer)` : ''}. Gekoppeld aan ${obj.id}.` } };
+  if (others.length && pool.length > 1) return { obj, melding: { type: 'dubbel', factuur_code: code, andere: others, tekst: `Er staan ${cand.length} trucks met ${vloot} in Objecten. Gekoppeld aan ${obj.id} (${objCode(obj) || obj.type || '?'}), die past bij de factuur. Controleer ${others.join(', ')}.` } };
+  return { obj, melding: null };
+}
+function invoiceToLines(inv) {
+  const code = modelCode(inv.model); const n = inv.vlootnummers.length || 1;
+  const lines = []; let rest = Math.round((inv.excl || 0) * 100);
+  const each = inv.huur && inv.huur.aantal === n && n > 1 ? Math.round(inv.huur.prijs * 100) : Math.floor(rest / n);
+  const extraTxt = inv.extra.length ? inv.extra.map(x => `${x.omschrijving} ${eur(x.bedrag)}`).join('; ') : '';
+  const mismatches = [];
+  (inv.vlootnummers.length ? inv.vlootnummers : [null]).forEach((v, i) => {
+    const cents = i === n - 1 ? rest : each; rest -= cents;
+    const { obj, melding } = v ? matchTruck(v, code) : { obj: null, melding: { type: 'niet_gevonden', tekst: 'Geen TWV-nummer op de factuur gevonden.' } };
+    if (n > 1 && melding && melding.type === 'type') mismatches.push(`${v} (${melding.object_code})`);
+    const bd = cents / 100;
+    const l = { factuurnummer: inv.factuurnummer, leverancier: inv.leverancier || 'Onbekend', factuurdatum: inv.factuurdatum, vervaldatum: inv.factuurdatum ? addDays(inv.factuurdatum, 30) : null,
+      periode_van: inv.periode_van, periode_tot: inv.periode_tot, vlootnummer: v, equipment: inv.model, object_id: obj ? obj.id : null,
+      bedrag_excl: bd, btw: inv.btw ?? 21, btw_bedrag: n === 1 ? inv.btw_bedrag : r2(bd * (inv.btw ?? 21) / 100), soort: 'Huur', status: 'Te controleren',
+      opmerking: [inv.omschrijving, n === 1 ? extraTxt : '', n > 1 ? `verzamelfactuur ${n} trucks` : ''].filter(Boolean).join(' · ') || null, bron: 'PDF ingelezen',
+      melding: n > 1 && melding && melding.type === 'type' ? null : melding };
+    lines.push(l);
+  });
+  if (mismatches.length) lines.forEach(l => { l.melding = l.melding || { type: 'verzamel', tekst: `Eén regel "${inv.model}" voor ${n} trucks. Alle nummers gevonden, maar ${mismatches.length} staan in Objecten met een ander type: ${mismatches.join(', ')}. De factuur noemt waarschijnlijk alleen het eerste type. Verdeeld in ${n} regels, elk gekoppeld aan zijn eigen truck.` }; });
+  return lines;
+}
+async function ocrFiles(list, progress) {
+  if (!IS_WEB()) throw new Error('Facturen automatisch inlezen werkt in de website (Vercel), niet in deze voorbeeldversie.');
+  progress('Leesprogramma laden… (eerste keer duurt dit even)');
+  await loadScript(OCR.pdfjs); await loadScript(OCR.tess); await loadScript(OCR.pdflib);
+  window.pdfjsLib.GlobalWorkerOptions.workerSrc = OCR.pdfjsWorker;
+  const worker = await Tesseract.createWorker('nld', 1, { workerPath: OCR.tessWorker, corePath: OCR.tessCore, langPath: OCR.lang });
+  const pages = [];
+  try {
+    for (const file of list) {
+      const buf = await file.arrayBuffer();
+      if (/pdf/.test(file.type) || /\.pdf$/i.test(file.name)) {
+        const pdf = await pdfjsLib.getDocument({ data: buf.slice(0) }).promise;
+        for (let p = 1; p <= pdf.numPages; p++) {
+          progress(`${file.name}: pagina ${p} van ${pdf.numPages} lezen…`);
+          const page = await pdf.getPage(p); const vp = page.getViewport({ scale: 2 });
+          const c = document.createElement('canvas'); c.width = vp.width; c.height = vp.height;
+          await page.render({ canvasContext: c.getContext('2d'), viewport: vp }).promise;
+          const { data } = await worker.recognize(c);
+          pages.push({ file, buf, page: p - 1, text: data.text });
+        }
+      } else {
+        progress(`${file.name} lezen…`);
+        const { data } = await worker.recognize(file); pages.push({ file, buf, page: null, text: data.text });
+      }
+    }
+  } finally { await worker.terminate(); }
+  // pagina's zonder factuurnummer horen bij de vorige factuur
+  const invs = [];
+  pages.forEach(pg => { const r = parseInvoiceText(pg.text);
+    if (r.factuurnummer || !invs.length) invs.push(Object.assign(r, { pages: [pg] }));
+    else { const last = invs[invs.length - 1]; last.pages.push(pg); const r2x = parseInvoiceText(last.pages.map(x => x.text).join('\n')); Object.assign(last, r2x, { pages: last.pages }); } });
+  return invs;
+}
+async function splitPdf(inv) {
+  const pg = inv.pages[0]; if (pg.page == null) return pg.file;
+  const src = await PDFLib.PDFDocument.load(pg.buf.slice(0)); const out = await PDFLib.PDFDocument.create();
+  const copied = await out.copyPages(src, inv.pages.map(p => p.page)); copied.forEach(p => out.addPage(p));
+  return new Blob([await out.save()], { type: 'application/pdf' });
+}
+function importPdfFacturen() {
+  const status = h('p', { class: 'muted', style: 'min-height:1.4em' });
+  const fileInp = h('input', { type: 'file', multiple: true, accept: 'application/pdf,image/*', style: 'display:none', onchange: e => run([...e.target.files]) });
+  const drop = h('div', { style: 'border:2px dashed var(--line);border-radius:12px;padding:30px;text-align:center;color:var(--muted);cursor:pointer', onclick: () => fileInp.click(),
+    ondragover: e => { e.preventDefault(); e.currentTarget.style.borderColor = 'var(--signal)'; }, ondragleave: e => { e.currentTarget.style.borderColor = 'var(--line)'; },
+    ondrop: e => { e.preventDefault(); run([...e.dataTransfer.files]); } },
+    h('div', { style: 'font:700 22px "Barlow Condensed",sans-serif;color:var(--ink)' }, 'Sleep facturen hierheen'), 'Gescande PDF (meerdere pagina’s mag) of foto’s. Meer hoef je niet te doen.', fileInp);
+  openDlg('Facturen inlezen uit PDF', [drop, status], 'De app leest elke factuur, koppelt hem aan de juiste heftruck en slaat hem direct op. Afwijkingen worden een melding.');
+  async function run(list) {
+    list = list.filter(f => /pdf|image/.test(f.type) || /\.(pdf|jpe?g|png)$/i.test(f.name)); if (!list.length) return toast('Kies een PDF of foto');
+    drop.style.pointerEvents = 'none'; drop.style.opacity = '.5';
+    let invs;
+    try { invs = await ocrFiles(list, t => { status.textContent = t; }); } catch (e) { status.textContent = ''; drop.style.pointerEvents = ''; drop.style.opacity = ''; return toast(e.message || 'Inlezen mislukt'); }
+    status.textContent = 'Opslaan…';
+    const fsx = await files(); const res = { ok: [], skip: [], fout: [], lines: [] };
+    const now = new Date().toISOString();
+    for (const inv of invs) {
+      if (!inv.factuurnummer || inv.excl == null) { res.fout.push(inv); continue; }
+      if (D.facturen.some(f => f.factuurnummer === inv.factuurnummer && f.bron !== 'PDF ingelezen')) { res.skip.push(inv); continue; }
+      const lines = invoiceToLines(inv); const occ = {};
+      try {
+        for (const l of lines) {
+          const key = [l.factuurnummer, l.vlootnummer || '', '', l.periode_van || '', (l.bedrag_excl || 0).toFixed(2)].join('|'); occ[key] = (occ[key] || 0) + 1;
+          const id = 'r' + fnv36(key) + '-' + occ[key];
+          const data = Object.assign({}, l, { gewijzigd_op: now, gewijzigd_door: me || null }); for (const k in data) if (data[k] === null) delete data[k];
+          await col('facturen').doc(id).set(data);
+          const i = D.facturen.findIndex(x => x.id === id); const nf = Object.assign({ id, _id: id }, data); if (i >= 0) D.facturen[i] = nf; else D.facturen.push(nf);
+          res.lines.push(nf);
+        }
+        if (fsx && !hasDoc(inv.factuurnummer)) {
+          const blob = await splitPdf(inv); const did = 'd' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+          const objIds = [...new Set(lines.map(l => l.object_id).filter(Boolean))];
+          const pad = `${objIds.length === 1 ? objIds[0] : 'verzamel'}/${did}-${inv.factuurnummer}.pdf`;
+          await fsx.upload(pad, blob, 'application/pdf');
+          const doc = { naam: `${inv.factuurnummer}.pdf`, pad, grootte: blob.size, mime: 'application/pdf', soort: 'Factuur', factuurnummer: inv.factuurnummer, object_ids: objIds, op: now, door: me || null };
+          if (objIds.length === 1) doc.object_id = objIds[0];
+          await col('documenten').doc(did).set(doc); D.documenten.push(Object.assign({ id: did, _id: did }, doc));
+        }
+        res.ok.push(Object.assign(inv, { lines }));
+      } catch (e) { return fail(e, 'opslaan'); }
+    }
+    updCounts();
+    const melds = res.lines.filter(l => l.melding);
+    const sum = res.ok.reduce((s, i) => s + i.excl, 0);
+    openDlg('Facturen ingelezen', [
+      h('div', { style: 'background:var(--ok-bg);color:var(--ok);border-radius:10px;padding:12px 14px;margin-bottom:12px' },
+        h('b', { style: 'color:var(--ink)' }, `${res.ok.length} facturen ingelezen en opgeslagen`), ` · ${res.lines.length} regels · ${eur(sum)} excl. btw · gekoppeld aan ${new Set(res.lines.map(l => l.object_id).filter(Boolean)).size} heftrucks${fsx ? ' · PDF per factuur bewaard' : ''}`),
+      h('div', { class: 'stats', style: 'grid-template-columns:repeat(4,1fr)' },
+        h('div', {}, h('b', {}, res.ok.filter(i => !i.lines.some(l => l.melding)).length), h('span', {}, 'helemaal in orde')),
+        h('div', {}, h('b', { style: melds.length ? 'color:var(--warn)' : '' }, new Set(melds.map(l => l.melding.type === 'verzamel' ? l.factuurnummer : l.id)).size), h('span', {}, 'meldingen')),
+        h('div', {}, h('b', {}, res.skip.length), h('span', {}, 'stonden er al in')),
+        h('div', {}, h('b', { style: res.fout.length ? 'color:var(--warn)' : '' }, res.fout.length), h('span', {}, 'niet te lezen'))),
+      res.fout.length ? h('p', { class: 'msg bad', style: 'padding:8px 10px;border-radius:8px' }, `Niet te lezen: ${res.fout.map(i => i.pages.map(p => p.file.name + (p.page != null ? ' p.' + (p.page + 1) : '')).join(', ')).join('; ')}. Voer die met “Nieuwe regel” in.`) : null,
+      res.skip.length ? h('p', { class: 'muted' }, `Al aanwezig (uit je Excel-lijst): ${res.skip.map(i => i.factuurnummer).join(', ')}.`) : null,
+      h('div', { class: 'tbl' }, h('table', {}, h('thead', {}, h('tr', {}, ['Factuurnr.', 'Datum', 'TWV', 'Op factuur', 'Periode', 'Excl. btw', 'Gekoppeld aan', 'Controle'].map((t, i) => h('th', { class: i === 5 ? 'num' : null }, t)))),
+        h('tbody', {}, res.lines.map(l => { const o = l.object_id ? objById()[l.object_id] : null;
+          return h('tr', {}, h('td', { style: 'font-weight:600' }, l.factuurnummer), h('td', {}, dmy(l.factuurdatum)), h('td', { style: 'font-weight:700' }, l.vlootnummer || '–'), h('td', {}, l.equipment || ''),
+            h('td', { style: 'white-space:nowrap' }, periode(l)), h('td', { class: 'num' }, eur(l.bedrag_excl)), h('td', {}, o ? `${o.id} · ${o.type || ''}` : '–'),
+            h('td', {}, l.melding ? h('span', { class: 'badge b-Hoog' }, '⚠ Melding') : h('span', { class: 'badge b-Afgerond' }, '✓ In orde'))); })))),
+      h('div', { class: 'actions' }, melds.length ? h('button', { class: 'btn sig', type: 'button', onclick: showMeldingen }, 'Meldingen bekijken') : null,
+        h('button', { class: 'btn alt', type: 'button', onclick: importPdfFacturen }, 'Nog meer inlezen'))],
+      'Status: Te controleren. Project (handgeschreven) kies je later per factuur of via Doorbelasting.');
+  }
+}
+
+// ---------------------------------------------------------------- monteurs & uurloon
+const aIncl = a => r2((Number(a.arbeid || 0) + Number(a.materiaal || 0) + Number(a.overig || 0)) * (1 + Number(a.btw ?? 21) / 100));
+function arbeidFiltered() { return D.arbeid.filter(a => !fF.jaar || (a.factuurdatum || '').startsWith(fF.jaar)).sort((a, b) => (b.factuurdatum || '').localeCompare(a.factuurdatum || '')); }
+function viewMonteurs(head) {
+  const rows = arbeidFiltered(); const yr = fF.jaar || 'alle jaren';
+  const U = rows.reduce((s, a) => s + Number(a.uren || 0), 0), A = rows.reduce((s, a) => s + Number(a.arbeid || 0), 0);
+  const M = rows.reduce((s, a) => s + Number(a.materiaal || 0) + Number(a.overig || 0), 0);
+  const tile = (c, l, n, x) => h('div', { class: 'tile ' + c }, h('div', { class: 'l' }, l), h('div', { class: 'n' }, n), h('div', { class: 'x' }, x));
+  const ob = objById();
+  const perTruck = {}; rows.forEach(a => { const rate = a.uren ? a.arbeid / a.uren : 0; (a.verdeling || []).forEach(v => { if (!v.object_id) return; const k = v.object_id; perTruck[k] = perTruck[k] || [0, 0]; perTruck[k][0] += Number(v.uren || 0); perTruck[k][1] += Number(v.uren || 0) * rate; }); });
+  const months = []; const now = new Date(); for (let i = 11; i >= 0; i--) { const d = new Date(now.getFullYear(), now.getMonth() - i, 1); months.push([dayKey(d).slice(0, 7), d.toLocaleDateString('nl-NL', { month: 'short', year: '2-digit' })]); }
+  const pm = {}; D.arbeid.forEach(a => { const k = monthKey(a.factuurdatum); pm[k] = pm[k] || [0, 0]; pm[k][0] += Number(a.uren || 0); pm[k][1] += Number(a.arbeid || 0); });
+  const maxR = Math.max(1, ...months.map(([k]) => pm[k] && pm[k][0] ? pm[k][1] / pm[k][0] : 0));
+  const tt = Object.entries(perTruck).sort((a, b) => b[1][1] - a[1][1]).slice(0, 8); const maxT = Math.max(1, ...tt.map(x => x[1][1]));
+  $('main').replaceChildren(head,
+    h('div', { class: 'tiles' },
+      tile('sig', `Gemiddeld uurloon ${yr} (excl.)`, U ? eur(A / U) : '–', 'alle monteurs samen, gewogen naar uren'),
+      ...monteurs().map(n => { const rs = rows.filter(a => a.monteur === n); const u = rs.reduce((s, a) => s + Number(a.uren || 0), 0), ar = rs.reduce((s, a) => s + Number(a.arbeid || 0), 0);
+        return tile('blu', n, u ? eur(ar / u) + ' /u' : '–', `${fmt(u)} uur · ${rs.length} facturen`); }),
+      tile('grn', `Totaal onderhoud ${yr}`, eur0(A + M), `${eur0(A)} arbeid · ${eur0(M)} materiaal/overig`)),
+    h('div', { class: 'toolbar', style: 'justify-content:flex-end' },
+      h('button', { class: 'btn sig', type: 'button', onclick: () => editArbeid(null) }, 'Monteursfactuur toevoegen')),
+    rows.length ? h('div', { class: 'panel wide', style: 'padding:6px 4px 4px' }, h('div', { class: 'tbl' }, h('table', {},
+      h('thead', {}, h('tr', {}, ['Datum', 'Monteur', 'Factuurnr.', 'Heftrucks / werkorders', 'Uren', 'Arbeid', 'Materiaal', 'Uurloon', 'PDF'].map((t, i) => h('th', { class: [4, 5, 6, 7].includes(i) ? 'num' : null }, t)))),
+      h('tbody', {}, rows.map(a => h('tr', { tabindex: '0', onclick: () => editArbeid(a), onkeydown: e => { if (e.key === 'Enter') editArbeid(a); } },
+        h('td', {}, dmy(a.factuurdatum)), h('td', { style: 'font-weight:600' }, a.monteur), h('td', {}, a.factuurnummer),
+        h('td', {}, (a.verdeling || []).length ? a.verdeling.map(v => [ob[v.object_id] ? truckLabel(ob[v.object_id]) : '', v.werkorder ? woNr(v.werkorder) : ''].filter(Boolean).join(' · ')).join(', ') : h('span', { class: 'muted' }, 'algemeen')),
+        h('td', { class: 'num' }, fmt(a.uren)), h('td', { class: 'num' }, eur(a.arbeid)), h('td', { class: 'num' }, eur(Number(a.materiaal || 0) + Number(a.overig || 0))),
+        h('td', { class: 'num', style: 'font-weight:700' }, a.uren ? eur(a.arbeid / a.uren) : '–'),
+        h('td', {}, D.documenten.some(d => d.arbeid_id === a.id) ? h('span', { class: 'badge b-Afgerond' }, '✓') : h('span', { class: 'badge b-Hoog' }, 'toevoegen'))))))),
+      h('p', { class: 'summary', style: 'padding:8px 12px' }, 'Uurloon = arbeid ÷ uren. Materiaal en voorrijkosten tellen niet mee in het uurloon, wel in het totaal.'))
+      : h('div', { class: 'panel wide' }, h('div', { class: 'empty' }, 'Nog geen monteursfacturen. Klik op “Monteursfactuur toevoegen”.')),
+    h('div', { class: 'panels', style: 'margin-top:12px' },
+      h('div', { class: 'panel' }, h('h3', {}, 'Uurloon per maand'), h('div', {}, months.map(([k, l]) => { const v = pm[k] && pm[k][0] ? pm[k][1] / pm[k][0] : 0;
+        return h('div', { class: 'hb' }, h('span', {}, l), h('span', { class: 'tr' }, h('i', { style: `width:${v / maxR * 100}%` })), h('span', { class: 'v' }, v ? eur(v) : '–')); }))),
+      h('div', { class: 'panel' }, h('h3', {}, `Onderhoudsuren per heftruck (${yr})`), tt.length ? h('div', {}, tt.map(([id, [u, k]]) => h('button', { class: 'hb', type: 'button', onclick: () => showDossier(id) },
+        h('span', {}, ob[id] ? truckLabel(ob[id]) : id), h('span', { class: 'tr' }, h('i', { style: `width:${k / maxT * 100}%;background:var(--info)` })), h('span', { class: 'v' }, `${fmt(u)} u · ${eur0(k)}`)))) : h('p', { class: 'muted' }, 'Verdeel de uren van een monteursfactuur over heftrucks om dit te zien.'))));
+}
+function editArbeid(a) {
+  const isNew = !a; a = a || { factuurdatum: todayKey(), btw: 21, monteur: monteurs()[0], verdeling: [], status: 'Te controleren' };
+  const objs = D.objecten.filter(o => o.status === 'Actief' && !NOT_TRUCK.test(o.objecttype || '')).sort((x, y) => (Number(x.twv) || 1e9) - (Number(y.twv) || 1e9));
+  const lab = o => [o.twv ? 'TWV ' + o.twv : o.id, o.type, o.locatie].filter(Boolean).join(' · ');
+  const omap = Object.fromEntries(objs.map(o => [lab(o), o.id])); const ob = objById();
+  const err = h('p', { class: 'err full' });
+  const out = { rate: h('b', { style: 'font:700 26px "Barlow Condensed",sans-serif' }), excl: h('b', { style: 'font:700 22px "Barlow Condensed",sans-serif' }), incl: h('b', { style: 'font:700 22px "Barlow Condensed",sans-serif' }) };
+  const inp = (name, label, attrs) => h('label', {}, label, h('input', Object.assign({ name, value: a[name] ?? '', autocomplete: 'off' }, attrs || {})));
+  const nf = v => v != null && v !== '' ? Number(v).toLocaleString('nl-NL', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : '';
+  const vrows = h('div', { class: 'vals full' });
+  const addRow = (v = {}) => { const oi = h('input', { list: 'aobjs', placeholder: 'Heftruck (TWV-nummer)', autocomplete: 'off', value: v.object_id && ob[v.object_id] ? lab(ob[v.object_id]) : '' });
+    const ui = h('input', { inputmode: 'decimal', placeholder: 'uren', value: v.uren != null ? fmt(v.uren) : '', style: 'text-align:right' });
+    const wi = h('input', { list: 'awos', placeholder: 'WO (optioneel)', autocomplete: 'off', value: v.werkorder ? woNr(v.werkorder) : '' });
+    const amt = h('span', { class: 'c', style: 'min-width:90px;text-align:right' });
+    const row = h('div', { class: 'val', style: 'grid-template-columns:1fr 90px 130px 90px auto;background:var(--bg)' }, oi, ui, wi, amt, h('button', { type: 'button', onclick: () => { row.remove(); calc(); } }, 'Weg'));
+    row._get = () => ({ oi, ui, wi, amt }); ui.addEventListener('input', calc); vrows.append(row); calc(); };
+  const fileInp = h('input', { type: 'file', accept: 'application/pdf,image/*', style: 'display:none' });
+  let pending = null; const fileLbl = h('span', {}, D.documenten.find(d => d.arbeid_id === a.id)?.naam || 'Sleep de PDF van de factuur hierheen of klik om te kiezen');
+  fileInp.addEventListener('change', e => { pending = e.target.files[0] || null; if (pending) fileLbl.textContent = pending.name; });
+  const drop = h('div', { class: 'full', style: 'border:2px dashed var(--line);border-radius:10px;padding:12px;color:var(--muted);cursor:pointer', onclick: () => fileInp.click(),
+    ondragover: e => e.preventDefault(), ondrop: e => { e.preventDefault(); pending = e.dataTransfer.files[0] || null; if (pending) fileLbl.textContent = pending.name; } }, fileLbl, fileInp);
+  const form = h('form', { class: 'grid', onsubmit: e => e.preventDefault() }, drop,
+    h('label', {}, 'Monteur *', h('select', { name: 'monteur' }, [...new Set(monteurs().concat(a.monteur ? [a.monteur] : []))].map(n => h('option', { selected: n === a.monteur }, n)))),
+    inp('factuurnummer', 'Factuurnummer *'), inp('factuurdatum', 'Factuurdatum *', { type: 'date' }), h('div'),
+    inp('periode_van', 'Gewerkt van', { type: 'date' }), inp('periode_tot', 'Gewerkt tot en met', { type: 'date' }),
+    inp('uren', 'Gewerkte uren *', { inputmode: 'decimal', value: a.uren != null ? fmt(a.uren) : '', style: 'text-align:right;font-weight:600' }),
+    inp('arbeid', 'Arbeid excl. btw *', { inputmode: 'decimal', value: nf(a.arbeid), style: 'text-align:right;font-weight:600' }),
+    inp('materiaal', 'Materiaal / onderdelen', { inputmode: 'decimal', value: nf(a.materiaal), style: 'text-align:right' }),
+    inp('overig', 'Voorrij- / overige kosten', { inputmode: 'decimal', value: nf(a.overig), style: 'text-align:right' }),
+    h('div', { class: 'full stats', style: 'grid-template-columns:repeat(3,1fr);margin:4px 0' },
+      h('div', { style: 'background:var(--care-bg)' }, h('span', {}, 'Uurloon deze factuur'), out.rate), h('div', {}, h('span', {}, 'Totaal excl. btw'), out.excl), h('div', {}, h('span', {}, 'Totaal incl. btw'), out.incl)),
+    h('div', { class: 'full', style: 'font:600 14px Barlow,sans-serif;color:var(--muted)' }, 'Uren verdelen over heftrucks (optioneel)'), vrows,
+    h('button', { class: 'link full', type: 'button', style: 'justify-self:start', onclick: () => addRow() }, '+ Heftruck toevoegen'),
+    h('label', { class: 'full' }, 'Opmerking', h('textarea', { name: 'opmerking' }, a.opmerking || '')),
+    h('datalist', { id: 'aobjs' }, objs.map(o => h('option', { value: lab(o) }))), h('datalist', { id: 'awos' }, D.werkorders.slice().sort((x, y) => y.id - x.id).map(w => h('option', { value: woNr(w.id) }, w.titel))), err);
+  const E = form.elements;
+  function calc() { const u = parseNum(E.uren.value), ar = parseNum(E.arbeid.value) || 0, m = parseNum(E.materiaal.value) || 0, o2 = parseNum(E.overig.value) || 0;
+    const rate = u > 0 && !Number.isNaN(ar) ? ar / u : null; out.rate.textContent = rate != null ? eur(rate) : '–';
+    out.excl.textContent = eur(ar + m + o2); out.incl.textContent = eur(r2((ar + m + o2) * 1.21));
+    [...vrows.children].forEach(r => { const g = r._get(); const vu = parseNum(g.ui.value); g.amt.textContent = rate != null && vu > 0 ? eur(vu * rate) : ''; }); }
+  ['uren', 'arbeid', 'materiaal', 'overig'].forEach(n => E[n].addEventListener('input', calc));
+  (a.verdeling || []).forEach(addRow); calc();
+  const save = async () => {
+    err.textContent = '';
+    const u = parseNum(E.uren.value), ar = parseNum(E.arbeid.value), m = parseNum(E.materiaal.value), o2 = parseNum(E.overig.value);
+    if (!E.factuurnummer.value.trim() || !E.factuurdatum.value) { err.textContent = 'Vul factuurnummer en datum in.'; return; }
+    if (!(u > 0) || ar == null || Number.isNaN(ar)) { err.textContent = 'Vul gewerkte uren en arbeid in.'; return; }
+    if (Number.isNaN(m) || Number.isNaN(o2)) { err.textContent = 'Materiaal of overige kosten is geen getal.'; return; }
+    const verdeling = []; for (const r of vrows.children) { const g = r._get(); if (!g.oi.value.trim() && !g.ui.value.trim()) continue;
+      const id = omap[g.oi.value] || D.objecten.find(o => o.twv === g.oi.value.replace(/\D/g, ''))?.id; const vu = parseNum(g.ui.value); const wm = g.wi.value.match(/(\d+)/);
+      if (!id) { err.textContent = `Heftruck “${g.oi.value}” niet gevonden.`; return; } if (!(vu > 0)) { err.textContent = 'Vul bij elke heftruck de uren in.'; return; }
+      verdeling.push({ object_id: id, uren: vu, werkorder: wm ? Number(wm[1]) : null }); }
+    if (verdeling.reduce((s, v) => s + v.uren, 0) > u + 0.01) { err.textContent = 'Er zijn meer uren verdeeld dan gewerkt.'; return; }
+    const rec = { monteur: E.monteur.value, factuurnummer: E.factuurnummer.value.trim(), factuurdatum: E.factuurdatum.value, periode_van: E.periode_van.value || null, periode_tot: E.periode_tot.value || null,
+      uren: u, arbeid: ar, materiaal: m || 0, overig: o2 || 0, btw: 21, verdeling, opmerking: E.opmerking.value.trim() || null, status: a.status || 'Te controleren', gewijzigd_op: new Date().toISOString(), gewijzigd_door: me || null };
+    const id = isNew ? 'a' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6) : a.id;
+    for (const k in rec) if (rec[k] === null) delete rec[k];
+    try { await col('arbeid').doc(id).set(rec); } catch (e) { return fail(e, 'monteursfactuur'); }
+    const i = D.arbeid.findIndex(x => x.id === id); const na = Object.assign({ id, _id: id }, rec); if (i >= 0) D.arbeid[i] = na; else D.arbeid.push(na);
+    if (pending) { const fs = await needFiles(); if (fs) { try { const did = 'd' + Date.now().toString(36); const pad = `monteurs/${did}-${pending.name.replace(/[^\w.\-]+/g, '_')}`; await fs.upload(pad, pending, pending.type);
+      const doc = { naam: pending.name, pad, grootte: pending.size, mime: pending.type, soort: 'Factuur', factuurnummer: rec.factuurnummer, arbeid_id: id, object_ids: verdeling.map(v => v.object_id), op: rec.gewijzigd_op, door: me || null };
+      await col('documenten').doc(did).set(doc); D.documenten.push(Object.assign({ id: did, _id: did }, doc)); } catch (e) { fail(e, 'upload'); } } }
+    toast('Opgeslagen'); dlg.close();
+  };
+  const del = async () => { if (!await askConfirm(`Monteursfactuur ${a.factuurnummer} verwijderen?`)) return; try { await col('arbeid').doc(a.id).delete(); } catch (e) { return fail(e, 'monteursfactuur'); } D.arbeid = D.arbeid.filter(x => x !== a); dlg.close(); };
+  openDlg(isNew ? 'Monteursfactuur toevoegen' : 'Monteursfactuur ' + a.factuurnummer, [form, h('div', { class: 'actions' }, h('button', { class: 'btn', type: 'button', onclick: save }, 'Opslaan'), !isNew ? h('button', { class: 'btn danger', type: 'button', onclick: del }, 'Verwijderen') : null)],
+    'Uurloon = arbeid ÷ uren. Monteurs beheer je bij Stamgegevens.');
+}
+
+// ---------------------------------------------------------------- doorbelasting per project
+const dF = { maand: null, open: new Set() };
+function poolLines(m) { return D.facturen.filter(f => monthKey(f.factuurdatum) === m && !f.project_code && !f.project_rtm && !f.project_naam && Number(f.bedrag_excl) > 0)
+  .sort((a, b) => (a.factuurdatum || '').localeCompare(b.factuurdatum || '') || String(a.factuurnummer).localeCompare(String(b.factuurnummer)) || String(a.vlootnummer || '').localeCompare(String(b.vlootnummer || ''))); }
+function computeDoorbelasting(doc, lines) {
+  const P = (doc.projecten || []).map(p => Object.assign({}, p));
+  const pool = r2(lines.reduce((s, l) => s + Number(l.bedrag_excl || 0), 0));
+  const vast = r2(P.filter(p => p.vast_bedrag != null).reduce((s, p) => s + Number(p.vast_bedrag), 0));
+  const uren = P.filter(p => p.vast_bedrag == null).reduce((s, p) => s + Number(p.uren || 0), 0);
+  const tarief = doc.tarief_handmatig != null ? Number(doc.tarief_handmatig) : (uren > 0 ? (pool - vast) / uren : 0);
+  P.forEach(p => { p.kosten = p.vast_bedrag != null ? r2(p.vast_bedrag) : r2(Number(p.uren || 0) * tarief); p.delen = []; });
+  let i = 0, rest = lines[0] ? Number(lines[0].bedrag_excl) : 0;
+  for (const p of P) { let need = p.kosten;
+    while (need > 0.004 && i < lines.length) { const take = Math.min(need, rest); p.delen.push({ line: lines[i], bedrag: r2(take) }); need -= take; rest -= take; if (rest < 0.005) { i++; rest = i < lines.length ? Number(lines[i].bedrag_excl) : 0; } }
+    p.open = r2(Math.max(0, need)); }
+  const totaal = r2(P.reduce((s, p) => s + p.kosten, 0));
+  return { P, pool, vast, uren, tarief, totaal, over: r2(Math.max(0, pool - totaal)) };
+}
+function parseUrenPaste(text) {
+  const lines = text.replace(/\r/g, '').split('\n').filter(l => l.trim()); if (!lines.length) return { error: 'Niets geplakt.' };
+  const norm = s => s.toLowerCase().replace(/[^a-z]/g, '');
+  let head = lines[0].split('\t').map(norm); let start = 1;
+  let ci = { naam: head.findIndex(x => x.startsWith('project')), rtm: head.findIndex(x => x.includes('rtm')), uren: head.findIndex(x => x.startsWith('uren')), tarief: head.findIndex(x => x.startsWith('tarief')), kosten: head.findIndex(x => x.startsWith('kosten')) };
+  if (ci.uren < 0) { ci = { naam: 0, rtm: 1, uren: 2, tarief: 3, kosten: 4 }; start = 0; }
+  const num = s => { let t = String(s || '').replace(/[€\s]/g, ''); if (/,\d{3}(\.|$)/.test(t) && /\.\d+$/.test(t)) t = t.replace(/,/g, ''); return parseNum(t); };
+  const rows = [];
+  lines.slice(start).forEach(l => { const c = l.split('\t'); const naam = (c[ci.naam] || '').trim(); const uren = num(c[ci.uren]);
+    if (!naam || /^totaal/i.test(naam) || uren == null || Number.isNaN(uren)) return;
+    rows.push({ naam, rtm: ci.rtm >= 0 ? String(c[ci.rtm] || '').trim() : '', uren, tarief: ci.tarief >= 0 ? num(c[ci.tarief]) : null, kosten: ci.kosten >= 0 ? num(c[ci.kosten]) : null }); });
+  if (!rows.length) return { error: 'Geen projecten gevonden. Kopieer de kolommen PROJECT, RTM NUMMER en UREN PER PROJECT (met kopregel).' };
+  const freq = {}; rows.forEach(r => { if (r.tarief) freq[r.tarief] = (freq[r.tarief] || 0) + 1; });
+  const common = Number(Object.entries(freq).sort((a, b) => b[1] - a[1])[0]?.[0]) || null;
+  const byRtm = Object.fromEntries(D.projecten.filter(p => p.rtm).map(p => [p.rtm, p]));
+  const projecten = rows.map(r => { const p = byRtm[r.rtm]; const vast = r.tarief && common && Math.abs(r.tarief - common) > 0.0001;
+    return { naam: r.naam, rtm: r.rtm || null, code: p ? p.id : null, klant: p ? p.klant || null : null, uren: r.uren, vast_bedrag: vast ? r2(r.kosten != null && !Number.isNaN(r.kosten) ? r.kosten : r.uren * r.tarief) : null }; });
+  return { projecten, tarief: common, verwacht: rows.reduce((s, r) => s + (r.kosten != null && !Number.isNaN(r.kosten) ? r.kosten : (r.tarief || 0) * r.uren), 0) };
+}
+function viewDoorbelasting(head) {
+  const months = [...new Set(D.facturen.map(f => monthKey(f.factuurdatum)).filter(k => k && k <= monthKey(addDays(todayKey(), 62))).concat(D.doorbelasting.map(d => d.id), [monthKey(todayKey())]))].sort().reverse();
+  if (!dF.maand) dF.maand = poolLines(months[1] || '').length ? months[1] : months.find(m => poolLines(m).length) || months[0];
+  const m = dF.maand; const doc = D.doorbelasting.find(d => d.id === m) || { id: m, projecten: [] };
+  const lines = poolLines(m);
+  const saved = D.facturen.filter(f => monthKey(f.factuurdatum) === m && (f.project_code || f.project_rtm || f.project_naam));
+  const sel = h('select', { 'aria-label': 'Maand', style: 'font-weight:600', onchange: e => { dF.maand = e.target.value; dF.open = new Set(); viewFacturatie(); } }, months.map(k => h('option', { value: k, selected: k === m }, monthName(k))));
+  const saveDoc = async upd => { const nd = Object.assign({}, doc, upd); delete nd.id; delete nd._id; try { await col('doorbelasting').doc(m).set(nd); } catch (e) { return fail(e, 'doorbelasting'); }
+    const i = D.doorbelasting.findIndex(d => d.id === m); const x = Object.assign({ id: m, _id: m }, nd); if (i >= 0) D.doorbelasting[i] = x; else D.doorbelasting.push(x); viewFacturatie(); };
+  const top = h('div', { class: 'toolbar', style: 'justify-content:space-between' }, h('div', { style: 'display:flex;gap:8px;align-items:center;flex-wrap:wrap' }, h('span', { class: 'muted' }, 'Facturen met factuurdatum in'), sel),
+    h('div', { style: 'display:flex;gap:8px;flex-wrap:wrap' },
+      h('button', { class: 'btn', type: 'button', onclick: () => plakUren(doc, saveDoc) }, 'Uren per project plakken uit Excel'),
+      h('button', { class: 'btn alt', type: 'button', onclick: () => projectRij(doc, saveDoc, null) }, 'Project of vast bedrag toevoegen')));
+  if (!lines.length && saved.length && (!(doc.projecten || []).length || doc.vastgelegd_op)) {
+    // al verdeeld (oude lijst of vastgelegd): per project met de heftrucks eronder
+    const g = new Map(); saved.forEach(f => { const k = f.project_code || f.project_rtm || f.project_naam; if (!g.has(k)) g.set(k, []); g.get(k).push(f); });
+    const items = [...g.values()].sort((a, b) => b.reduce((s, r) => s + Number(r.bedrag_excl || 0), 0) - a.reduce((s, r) => s + Number(r.bedrag_excl || 0), 0));
+    const tot = saved.reduce((s, r) => s + Number(r.bedrag_excl || 0), 0), ur = saved.reduce((s, r) => s + Number(r.uren || 0), 0);
+    $('main').replaceChildren(head, top, h('p', { class: 'summary' }, `${monthName(m)} is ${doc.vastgelegd_op ? 'vastgelegd op ' + dt(doc.vastgelegd_op) + ' en' : 'al'} verdeeld over ${items.length} projecten (${saved.length} regels). ${doc.tarief ? 'Tarief € ' + Number(doc.tarief).toLocaleString('nl-NL', { maximumFractionDigits: 5 }) : 'Gemiddeld tarief ' + (ur ? eur(tot / ur) : '–')} per uur.`),
+      dbTable(items.map(rs => ({ naam: projLabel(rs[0]) || '(geen project)', rtm: rs[0].project_rtm, klant: rs[0].klant, uren: rs.reduce((s, r) => s + Number(r.uren || 0), 0), kosten: rs.reduce((s, r) => s + Number(r.bedrag_excl || 0), 0), open: 0, delen: rs.map(r => ({ line: r, bedrag: Number(r.bedrag_excl) })) })), tot, ur, null, m),
+      h('div', { class: 'actions' }, h('button', { class: 'btn alt', type: 'button', onclick: () => exportDoorbelasting(m, items.map(rs => ({ naam: rs[0].project_naam || '', rtm: rs[0].project_rtm || '', uren: rs.reduce((s, r) => s + Number(r.uren || 0), 0), kosten: rs.reduce((s, r) => s + Number(r.bedrag_excl || 0), 0), delen: rs.map(r => ({ line: r, bedrag: Number(r.bedrag_excl) })) })), ur ? tot / ur : null) }, 'Exporteren naar Excel')));
+    return;
+  }
+  const C = computeDoorbelasting(doc, lines);
+  const tile = (c, l, n, x) => h('div', { class: 'tile ' + c }, h('div', { class: 'l' }, l), h('div', { class: 'n' }, n), h('div', { class: 'x' }, x));
+  const verw = doc.verwacht ? r2(doc.verwacht - C.pool) : 0;
+  const els = [head, top,
+    h('div', { class: 'tiles' },
+      tile('blu', `1 · Heftruckfacturen ${monthName(m)}`, eur0(C.pool), `${new Set(lines.map(l => l.factuurnummer)).size} facturen · ${lines.length} regels nog niet verdeeld`),
+      tile('sig', '2 · Uren per project', fmt(C.uren) + ' u', `${C.P.filter(p => p.vast_bedrag == null).length} projecten${C.vast ? ` + vast ${eur0(C.vast)}` : ''}`),
+      tile('', '3 · Tarief per uur', C.tarief ? '€ ' + C.tarief.toLocaleString('nl-NL', { minimumFractionDigits: 2, maximumFractionDigits: 5 }) : '–', doc.tarief_handmatig != null ? 'vastgezet (uit Excel)' : '(facturen − vaste bedragen) ÷ uren'),
+      verw > 1 ? tile('red', 'Nog niet ingelezen', eur0(verw), `je Excel rekent met ${eur0(doc.verwacht)}`) : tile('grn', 'Verdeeld', eur0(C.totaal - C.P.reduce((s, p) => s + p.open, 0)), C.over ? `${eur0(C.over)} nog niet toegewezen` : 'van de facturen'))];
+  if (doc.tarief_handmatig != null || doc.tarief_excel) els.push(h('div', { style: 'display:flex;gap:10px;align-items:center;background:var(--care-bg);color:var(--care);border-radius:10px;padding:10px 14px;margin-bottom:12px;flex-wrap:wrap' },
+    h('span', { style: 'flex:1 1 380px' }, doc.tarief_handmatig != null ? `Het tarief komt uit je Excel. Zodra alle facturen van ${monthName(m)} zijn ingelezen kun je het door de app laten berekenen (nu zou dat ${C.uren ? '€ ' + ((C.pool - C.vast) / C.uren).toLocaleString('nl-NL', { maximumFractionDigits: 5 }) : '–'} zijn).` : `Je Excel gebruikte € ${String(doc.tarief_excel).replace('.', ',')} per uur.`),
+    doc.tarief_handmatig != null ? h('button', { class: 'btn alt', type: 'button', onclick: () => saveDoc({ tarief_handmatig: null, tarief_excel: doc.tarief_handmatig }) }, 'Tarief zelf berekenen') : h('button', { class: 'btn alt', type: 'button', onclick: () => saveDoc({ tarief_handmatig: doc.tarief_excel }) }, 'Excel-tarief gebruiken')));
+  if (!C.P.length) els.push(h('div', { class: 'panel wide' }, h('div', { class: 'empty' }, lines.length ? `Er zijn ${lines.length} factuurregels om te verdelen. Plak de uren per project uit Excel om te beginnen.` : `Geen onverdeelde facturen met factuurdatum in ${monthName(m)}.`)));
+  else {
+    els.push(dbTable(C.P, C.totaal, C.uren + C.P.filter(p => p.vast_bedrag != null).reduce((s, p) => s + Number(p.uren || 0), 0), { doc, saveDoc }, m, C));
+    els.push(h('div', { class: 'actions' },
+      h('button', { class: 'btn alt', type: 'button', onclick: () => exportDoorbelasting(m, C.P, C.tarief) }, 'Exporteren naar Excel'),
+      h('button', { class: 'btn sig', type: 'button', onclick: () => vastleggen(m, C, saveDoc) }, 'Doorbelasting vastleggen')));
+    els.push(h('p', { class: 'summary' }, 'Elke heftruckfactuur wordt naar rato van de uren over de projecten verdeeld, van boven naar beneden. Vastleggen zet de projecten bij de factuurregels in Facturatie.'));
+  }
+  $('main').replaceChildren(...els);
+}
+function dbTable(P, totaal, uren, edit, m, C) {
+  const grid = 'grid-template-columns:24px minmax(0,1fr) 130px 90px 120px 160px';
+  const row = p => { const key = p.naam + '|' + (p.rtm || ''); const open = dF.open.has(key); const trucks = [...new Set(p.delen.map(d => d.line.vlootnummer).filter(Boolean))];
+    const badge = p.open > 0.01 ? (p.delen.length ? h('span', { class: 'badge b-Hoog' }, `Nog ${eur(p.open)} open`) : h('span', { class: 'badge b-grey' }, 'Wacht op facturen')) : h('span', { class: 'badge b-Afgerond' }, 'Volledig gedekt');
+    const headEl = h('div', { style: `display:grid;${grid};gap:12px;align-items:center;padding:11px 14px;cursor:pointer;${open ? 'background:var(--surface)' : ''}`, tabindex: '0',
+      onclick: () => { open ? dF.open.delete(key) : dF.open.add(key); viewFacturatie(); }, onkeydown: e => { if (e.key === 'Enter') e.currentTarget.click(); } },
+      h('span', { class: 'muted' }, open ? '▾' : '▸'), h('div', {}, h('b', {}, p.naam), h('div', { class: 'muted', style: 'font-size:13px' }, `${trucks.length} heftruck${trucks.length === 1 ? '' : 's'}${trucks.length ? ' · ' + trucks.slice(0, 4).join(', ') + (trucks.length > 4 ? ' …' : '') : ''}${p.klant ? ' · ' + p.klant : ''}`)),
+      h('span', { class: 'muted' }, p.rtm || ''), h('span', { style: 'text-align:right' }, fmt(p.uren) + ' u', p.vast_bedrag != null ? h('small', { style: 'color:var(--care)' }, ' vast') : null),
+      h('b', { style: 'text-align:right' }, eur(p.kosten)), h('span', { style: 'justify-self:end' }, badge));
+    const body = open ? h('div', { style: 'background:var(--bg)' },
+      p.delen.map(d => h('div', { style: `display:grid;${grid};gap:12px;align-items:center;padding:7px 14px;font-size:15px;border-top:1px solid var(--line)` }, h('span'),
+        h('span', {}, h('b', {}, d.line.vlootnummer || '–'), h('span', { class: 'muted' }, ` ${d.line.equipment || ''} · factuur ${d.line.factuurnummer}`)),
+        h('span', { class: 'muted', style: 'text-align:right;font-size:13px' }, Math.abs(d.bedrag - Number(d.line.bedrag_excl)) > 0.01 ? 'deel van ' + eur(d.line.bedrag_excl) : 'hele factuur'),
+        h('span', { class: 'muted', style: 'text-align:right;font-size:13px' }, C && C.tarief ? fmt(d.bedrag / C.tarief) + ' u' : (d.line.uren ? fmt(d.line.uren) + ' u' : '')), h('span', { style: 'text-align:right' }, eur(d.bedrag)), h('span'))),
+      p.open > 0.01 && p.vast_bedrag == null ? h('div', { style: 'padding:8px 50px;font-size:14px;color:var(--care);background:var(--care-bg)' }, `Nog ${eur(p.open)} te verdelen. Zodra de overige facturen van ${monthName(m)} zijn ingelezen, vult dit zich vanzelf aan.`) : null,
+      edit ? h('div', { style: 'padding:8px 50px;display:flex;gap:14px' }, h('button', { class: 'link', type: 'button', onclick: () => projectRij(edit.doc, edit.saveDoc, p) }, 'Wijzigen'),
+        h('button', { class: 'link', type: 'button', onclick: async () => { if (!await askConfirm(`${p.naam} uit de verdeling halen?`)) return; edit.saveDoc({ projecten: edit.doc.projecten.filter(x => !(x.naam === p.naam && (x.rtm || '') === (p.rtm || ''))) }); } }, 'Verwijderen')) : null) : null;
+    return h('div', { style: 'border-bottom:1px solid var(--line)' }, headEl, body); };
+  return h('div', { class: 'panel wide', style: 'padding:0;overflow:hidden' },
+    h('div', { style: `display:grid;${grid};gap:12px;padding:10px 14px;color:var(--muted);font-size:13px;font-weight:600;border-bottom:1px solid var(--line)` }, h('span'), h('span', {}, 'Project · heftrucks eronder'), h('span', {}, 'RTM-nummer'), h('span', { style: 'text-align:right' }, 'Uren'), h('span', { style: 'text-align:right' }, 'Kosten excl. btw'), h('span', { style: 'justify-self:end' }, 'Gedekt door facturen')),
+    P.map(row),
+    h('div', { style: `display:grid;${grid};gap:12px;padding:12px 14px;background:var(--head);color:var(--headink);font-weight:700` }, h('span'), h('span', {}, 'Totaal ' + monthName(m)), h('span'), h('span', { style: 'text-align:right' }, fmt(uren) + ' u'), h('span', { style: 'text-align:right' }, eur(totaal)), h('span')));
+}
+function plakUren(doc, saveDoc) {
+  const ta = h('textarea', { style: 'height:180px;font:13px/1.3 ui-monospace,Menlo,Consolas,monospace', placeholder: 'Kopieer in Excel de kolommen PROJECT, RTM NUMMER, UREN PER PROJECT (en eventueel TARIEF en KOSTEN) met de kopregel, en plak hier.' });
+  const out = h('div');
+  const go = () => { const r = parseUrenPaste(ta.value); if (r.error) { out.replaceChildren(h('p', { class: 'err' }, r.error)); return; }
+    const vast = r.projecten.filter(p => p.vast_bedrag != null);
+    out.replaceChildren(h('p', {}, `${r.projecten.length} projecten, ${fmt(r.projecten.filter(p => p.vast_bedrag == null).reduce((s, p) => s + p.uren, 0))} uur${vast.length ? `, ${vast.length} met vast bedrag (${vast.map(p => p.naam + ' ' + eur(p.vast_bedrag)).join(', ')})` : ''}.${r.tarief ? ` Tarief in Excel: € ${String(r.tarief).replace('.', ',')}.` : ''}`),
+      h('div', { class: 'actions' }, h('button', { class: 'btn sig', type: 'button', onclick: () => { saveDoc({ projecten: r.projecten, tarief_excel: r.tarief || null, tarief_handmatig: r.tarief || null, verwacht: r.verwacht ? r2(r.verwacht) : null, bijgewerkt: new Date().toISOString() }); dlg.close(); } }, (doc.projecten || []).length ? 'Vervangen' : 'Overnemen'))); };
+  openDlg('Uren per project plakken', [ta, h('div', { class: 'actions' }, h('button', { class: 'btn', type: 'button', onclick: go }, 'Controleren')), out], 'Zelfde kolommen als HEFTRUCKS – SEPTEMBER 2026. Een afwijkend tarief (zoals Strippen/Pendel Hars) wordt een vast bedrag.');
+  setTimeout(() => ta.focus(), 50);
+}
+function projectRij(doc, saveDoc, p) {
+  const pOpts = new Map(D.projecten.slice().sort((a, b) => (a.fase === 'Lopend' ? 0 : 1) - (b.fase === 'Lopend' ? 0 : 1) || Number(b.id) - Number(a.id)).map(x => [pLabel(x), x]));
+  const err = h('p', { class: 'err full' });
+  const form = h('form', { class: 'grid', onsubmit: e => e.preventDefault() },
+    h('label', { class: 'full' }, 'Project', h('input', { name: 'proj', list: 'dbproj', autocomplete: 'off', value: p ? [p.rtm, p.naam].filter(Boolean).join(' · ') : '', placeholder: 'Typ RTM-nummer of naam' }), h('datalist', { id: 'dbproj' }, [...pOpts.keys()].map(k => h('option', { value: k })))),
+    h('label', {}, 'Uren', h('input', { name: 'uren', inputmode: 'decimal', value: p ? fmt(p.uren) : '' })),
+    h('label', {}, 'Vast bedrag (laat leeg voor uurtarief)', h('input', { name: 'vast', inputmode: 'decimal', value: p && p.vast_bedrag != null ? fmt(p.vast_bedrag) : '' })), err);
+  openDlg(p ? 'Project wijzigen' : 'Project of vast bedrag toevoegen', [form, h('div', { class: 'actions' }, h('button', { class: 'btn', type: 'button', onclick: () => {
+    const E = form.elements; const v = E.proj.value.trim(); const x = pOpts.get(v) || D.projecten.find(q => q.rtm === v) || null;
+    const u = parseNum(E.uren.value) || 0, vb = parseNum(E.vast.value);
+    if (!v) { err.textContent = 'Kies of typ een project.'; return; } if (Number.isNaN(u) || Number.isNaN(vb)) { err.textContent = 'Uren of bedrag is geen getal.'; return; }
+    const np = { naam: x ? x.naam : v, rtm: x ? x.rtm || null : null, code: x ? x.id : null, klant: x ? x.klant || null : null, uren: u, vast_bedrag: vb == null ? null : vb };
+    const list = (doc.projecten || []).slice(); const i = p ? list.findIndex(q => q.naam === p.naam && (q.rtm || '') === (p.rtm || '')) : -1;
+    if (i >= 0) list[i] = np; else list.push(np); saveDoc({ projecten: list }); dlg.close(); } }, 'Opslaan'))]);
+}
+async function vastleggen(m, C, saveDoc) {
+  const open = C.P.reduce((s, p) => s + p.open, 0);
+  if (!await askConfirm(`Doorbelasting ${monthName(m)} vastleggen?\n\nDe factuurregels worden per project gesplitst (zoals in je oude lijst).${open > 0.01 ? `\nLet op: ${eur(open)} is nog niet gedekt door facturen.` : ''}${C.over > 0.01 ? `\n${eur(C.over)} aan facturen blijft onverdeeld.` : ''}`)) return;
+  const now = new Date().toISOString(); const per = new Map();
+  C.P.forEach(p => p.delen.forEach(d => { if (!per.has(d.line.id)) per.set(d.line.id, []); per.get(d.line.id).push({ p, bedrag: d.bedrag }); }));
+  try {
+    for (const [lid, parts] of per) {
+      const l = D.facturen.find(x => x.id === lid); if (!l) continue;
+      const base = Object.fromEntries(Object.entries(l).filter(([k]) => !['id', '_id', 'melding'].includes(k)));
+      const sumParts = parts.reduce((s, x) => s + x.bedrag, 0); const restB = r2(Number(l.bedrag_excl) - sumParts);
+      for (let i = 0; i < parts.length; i++) { const { p, bedrag } = parts[i]; const id = lid + '-p' + (i + 1);
+        const data = Object.assign({}, base, { bedrag_excl: bedrag, btw_bedrag: r2(bedrag * Number(l.btw ?? 21) / 100), project_code: p.code || null, project_rtm: p.rtm || null, project_naam: p.naam, klant: p.klant || null, uren: C.tarief ? r2(bedrag / C.tarief) : null, doorbelasting: m, gewijzigd_op: now, gewijzigd_door: me || null });
+        for (const k in data) if (data[k] === null) delete data[k];
+        await col('facturen').doc(id).set(data); D.facturen.push(Object.assign({ id, _id: id }, data)); }
+      if (restB > 0.004) { await col('facturen').doc(lid).update({ bedrag_excl: restB, btw_bedrag: r2(restB * Number(l.btw ?? 21) / 100), gewijzigd_op: now }); Object.assign(l, { bedrag_excl: restB, btw_bedrag: r2(restB * Number(l.btw ?? 21) / 100) }); }
+      else { await col('facturen').doc(lid).delete(); D.facturen = D.facturen.filter(x => x.id !== lid); }
+    }
+  } catch (e) { return fail(e, 'vastleggen'); }
+  toast(`Doorbelasting ${monthName(m)} vastgelegd`); saveDoc({ vastgelegd_op: now, tarief: C.tarief });
+}
+async function exportDoorbelasting(m, P, tarief) {
+  const titel = `HEFTRUCKS - ${monthName(m).toUpperCase()}`;
+  const rows1 = [['PROJECT', 'RTM NUMMER', 'UREN PER PROJECT', 'TARIEF PER UUR', 'KOSTEN EX BTW']];
+  P.forEach(p => rows1.push([p.naam, p.rtm || '', Number(p.uren || 0), p.vast_bedrag != null ? (p.uren ? r2(p.vast_bedrag / p.uren) : '') : (tarief || ''), r2(p.kosten)]));
+  const rows2 = [['PROJECT', 'RTM NUMMER', 'FACTUURNUMMER', 'VLOOTNUMMER', 'EQUIPMENT', 'HUURPERIODE', 'DEEL BEDRAG EX BTW', 'UREN']];
+  P.forEach(p => p.delen.forEach(d => rows2.push([p.naam, p.rtm || '', d.line.factuurnummer, d.line.vlootnummer || '', d.line.equipment || '', periode(d.line), r2(d.bedrag), tarief ? r2(d.bedrag / tarief) : ''])));
+  if (IS_WEB()) {
+    try {
+      await loadScript('https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js');
+      const wb = XLSX.utils.book_new();
+      const s1 = XLSX.utils.aoa_to_sheet(rows1); const n = rows1.length;
+      for (let r = 2; r <= n; r++) { const p = P[r - 2]; if (p.vast_bedrag == null && tarief) s1['E' + r] = { t: 'n', f: `C${r}*D${r}`, v: r2(p.kosten), z: '#,##0.00' }; }
+      XLSX.utils.sheet_add_aoa(s1, [['', '', null, '', null]], { origin: 'A' + (n + 1) });
+      s1['C' + (n + 1)] = { t: 'n', f: `SUM(C2:C${n})` }; s1['E' + (n + 1)] = { t: 'n', f: `SUM(E2:E${n})`, z: '#,##0.00' };
+      s1['!cols'] = [{ wch: 42 }, { wch: 16 }, { wch: 18 }, { wch: 15 }, { wch: 15 }];
+      const s2 = XLSX.utils.aoa_to_sheet(rows2); s2['!cols'] = [{ wch: 42 }, { wch: 16 }, { wch: 14 }, { wch: 13 }, { wch: 22 }, { wch: 22 }, { wch: 18 }, { wch: 8 }];
+      XLSX.utils.book_append_sheet(wb, s1, 'Per project'); XLSX.utils.book_append_sheet(wb, s2, 'Heftrucks per project');
+      XLSX.writeFile(wb, `${titel}.xlsx`); return;
+    } catch (e) { toast('Excel-bestand maken lukte niet, je kunt de tabel kopiëren'); }
+  }
+  const text = rows1.map(r => r.map(v => typeof v === 'number' ? String(v).replace('.', ',') : v).join('\t')).join('\n') + '\n\n' + rows2.map(r => r.map(v => typeof v === 'number' ? String(v).replace('.', ',') : v).join('\t')).join('\n');
+  const ta = h('textarea', { readonly: true, style: 'height:220px;font:13px/1.3 ui-monospace,Menlo,Consolas,monospace' }, text);
+  openDlg('Kopiëren voor Excel', [h('p', { class: 'muted' }, 'Eerst per project (zelfde kolommen als je sheet), daaronder de heftrucks per project. Plak in cel A1.'), ta,
+    h('div', { class: 'actions' }, h('button', { class: 'btn', type: 'button', onclick: async () => { if (!await copyText(text)) { ta.focus(); ta.select(); } } }, 'Kopiëren'))], titel);
 }
 
 // ---------- start ----------

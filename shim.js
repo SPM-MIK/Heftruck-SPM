@@ -3,6 +3,7 @@
 (function () {
   'use strict';
   const C = window.CONFIG || {};
+  window.SM_WEB = true;   // website: documenten en PDF inlezen beschikbaar
   const NO_PW = C.WACHTWOORD === false;          // tijdelijk zonder wachtwoord: alleen naam vragen
   const NKEY = 'sm-naam';
   let sb = null, session = null, readyRes;
@@ -139,11 +140,20 @@
     isOwner: () => false, canEdit: () => true, can: () => true
   };
 
+  // ---------- documenten (Supabase Storage, bucket 'documenten') ----------
+  const BUCKET = 'documenten';
+  const filesApi = {
+    async upload(path, blob, type) { const { error } = await sb.storage.from(BUCKET).upload(path, blob, { contentType: type || 'application/octet-stream', upsert: true }); if (error) throw dbErr(error, /bucket/i.test(error.message) ? 'not_found' : 'unavailable'); },
+    async url(path) { const { data, error } = await sb.storage.from(BUCKET).createSignedUrl(path, 3600); if (error) throw dbErr(error); return data.signedUrl; },
+    async remove(path) { const { error } = await sb.storage.from(BUCKET).remove([path]); if (error) throw dbErr(error); }
+  };
+
   window.claude = {
     async use(name) {
       await ready;
       if (name === 'db') return db;
       if (name === 'user') return user;
+      if (name === 'files') return filesApi;
       return null;
     }
   };
